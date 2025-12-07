@@ -447,7 +447,7 @@ Secrets Created:
     jwt_secret_name = f"{args.release_name}-jwt-signing-key"
     jwt_secret_data = {
         "jwt-signing-key": jwt_key,
-        "storage-encryption-key": base64.b64encode(storage_key).decode()
+        "storage-encryption-key": storage_key.decode()  # Fernet key is already base64-encoded
     }
 
     if not creator.create_secret(

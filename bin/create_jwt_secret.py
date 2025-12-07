@@ -194,10 +194,8 @@ class JWTSecretCreator:
             ),
             type="Opaque",
             string_data={
-                "jwt-signing-key": jwt_key
-            },
-            data={
-                "storage-encryption-key": base64.b64encode(storage_key).decode()
+                "jwt-signing-key": jwt_key,
+                "storage-encryption-key": storage_key.decode()  # Fernet key is already base64-encoded
             }
         )
 
