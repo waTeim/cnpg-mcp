@@ -167,7 +167,56 @@ class Auth0MCPSetup:
                 if e.response is not None:
                     print(f"Response: {e.response.text}")
             raise
-    
+
+    def validate_token(self) -> bool:
+        """
+        Validate that the access token is valid and not expired.
+        Makes a simple API call to check token validity.
+        Raises an exception with a clear message if token is invalid/expired.
+        """
+        try:
+            # Make a simple GET request to verify token
+            self._make_request("GET", "/clients", params={"per_page": 1}, silent_errors=True)
+            return True
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 401:
+                error_body = {}
+                try:
+                    error_body = e.response.json()
+                except:
+                    pass
+
+                error_msg = error_body.get('message', 'Unauthorized')
+
+                # Check if it's an expired token
+                if 'expired' in error_msg.lower():
+                    print("\n" + "=" * 70)
+                    print("❌ TOKEN EXPIRED")
+                    print("=" * 70)
+                    print(f"Error: {error_msg}")
+                    print("\nYour Auth0 management API token has expired.")
+                    print("\nTo fix this:")
+                    print("  1. Generate a new token at:")
+                    print(f"     https://{self.domain}/dashboard/settings/tenant")
+                    print("  2. Rerun this script with --token YOUR_NEW_TOKEN")
+                    print("\nAlternatively, run without --token to auto-generate one.")
+                    print("=" * 70)
+                else:
+                    print("\n" + "=" * 70)
+                    print("❌ AUTHENTICATION FAILED")
+                    print("=" * 70)
+                    print(f"Error: {error_msg}")
+                    print("\nYour Auth0 management API token is invalid or lacks required permissions.")
+                    print("\nTo fix this:")
+                    print("  1. Verify your token at:")
+                    print(f"     https://{self.domain}/dashboard/settings/tenant")
+                    print("  2. Ensure the token has 'read:clients' and 'create:clients' scopes")
+                    print("  3. Rerun this script with a valid token")
+                    print("=" * 70)
+
+                raise SystemExit(1)
+            raise
+
     def check_dcr_enabled(self) -> bool:
         """Check if DCR is already enabled."""
         print("\n🔍 Checking if DCR is already enabled...")
@@ -413,7 +462,7 @@ class Auth0MCPSetup:
         existing = next((c for c in all_clients if c.get("name") == name), None)
 
         if existing and recreate:
-            print(f"🔄 Recreating test client (--recreate-client specified)...")
+            print(f"🔄 Recreating server client (--recreate-client specified)...")
             if self.delete_client(existing['client_id']):
                 print(f"✅ Deleted existing client")
                 existing = None
@@ -422,7 +471,7 @@ class Auth0MCPSetup:
 
         if existing:
             client_id = existing['client_id']
-            print(f"✅ Test client already exists")
+            print(f"✅ Server client already exists")
             print(f"   Client ID: {client_id}")
 
             if existing_secret:
@@ -500,7 +549,7 @@ class Auth0MCPSetup:
             else:
                 print(f"   ✅ Grant types already configured")
         else:
-            # Create new test client
+            # Create new server client
             # FastMCP needs authorization_code for user authentication, not just client_credentials
             try:
                 # Extract base URL from api_identifier for callback configuration
@@ -582,13 +631,15 @@ class Auth0MCPSetup:
                     print(f"✅ Granted API access")
                     print(f"   Scopes: {', '.join(scopes) if scopes else 'all'}")
                 except Exception as e:
-                    # Check if grant already exists
-                    if "already exists" in str(e).lower():
+                    # Check if grant already exists (409 Conflict or "already exists" message)
+                    if "already exists" in str(e).lower() or "409" in str(e) or "conflict" in str(e).lower():
                         print("✅ API access already granted")
                     else:
-                        print(f"⚠️  Could not create grant (insufficient permissions - assuming already configured)")
+                        print(f"⚠️  Could not create grant: {e}")
+                        print(f"   (This may be normal if already configured)")
         except Exception as e:
-            print(f"⚠️  Could not verify API grants (insufficient permissions - assuming already configured)")
+            print(f"⚠️  Could not verify API grants: {e}")
+            print(f"   (This may be normal if already configured)")
 
         return existing, client_id, client_secret
 
@@ -1210,13 +1261,13 @@ Examples:
         )
 
         if saved_mgmt_client_id and saved_mgmt_client_secret and config['domain']:
-            print(f"\n🔑 No token provided, getting management token from saved credentials...")
+            print(f"\n🔑 No token provided via command line - using saved credentials to obtain one...")
             token = get_management_token(config['domain'], saved_mgmt_client_id, saved_mgmt_client_secret)
             if token:
                 config['token'] = token
-                print(f"✅ Successfully obtained management token")
+                print(f"✅ Successfully obtained management token from saved credentials")
             else:
-                print(f"⚠️  Could not get management token automatically")
+                print(f"⚠️  Could not get management token from saved credentials")
 
         if not config['token']:
             missing.append("token")
@@ -1303,6 +1354,11 @@ Examples:
     try:
         setup = Auth0MCPSetup(config['domain'], config['token'])
 
+        # Validate token before proceeding
+        print("\n🔐 Validating Auth0 management token...")
+        setup.validate_token()
+        print("✅ Token is valid")
+
         # Try to enable DCR, but don't fail if we lack permissions (may already be enabled)
         # Only attempt DCR setup if --use-dcr flag is provided
         if args.use_dcr:
@@ -1323,7 +1379,8 @@ Examples:
             api = None
         
         # Get existing management secret from correct location (try both old and new structure)
-        existing_mgmt_secret = config.get('management_api', {}).get('client_secret') or config.get('client_secret')
+        # Get existing secrets from saved config file, not command-line config
+        existing_mgmt_secret = config_mgr.config.get('management_api', {}).get('client_secret') or config_mgr.config.get('client_secret')
 
         client, client_id, client_secret = setup.create_management_api_client(
             name=f"{config['deployment_name']} - Management API",
@@ -1332,7 +1389,7 @@ Examples:
         )
 
         # Create server client for FastMCP OAuth (optional - skip if we lack permissions)
-        server_client_config = config.get('server_client', {})
+        server_client_config = config_mgr.config.get('server_client', {})
         try:
             server_client, server_client_id, server_client_secret = setup.create_server_client(
                 name=f"{config['deployment_name']} - Server",
@@ -1342,7 +1399,7 @@ Examples:
             )
         except Exception as e:
             print(f"⚠️  Could not verify/create server client (may already exist): {e}")
-            print(f"   Continuing with test client setup...")
+            print(f"   Continuing with server client from config...")
             # Use existing server client from config if available
             server_client_id = server_client_config.get('client_id', '')
             server_client_secret = server_client_config.get('client_secret', '')
@@ -1403,13 +1460,17 @@ Examples:
         
         if args.save_config:
             # Preserve existing secrets if new ones aren't available
-            existing_mgmt_secret = config.get('management_api', {}).get('client_secret', '') or config.get('client_secret', '')
-            existing_server_secret = config.get('server_client', {}).get('client_secret', '')
+            # Read from config_mgr.config (file config), not config (command-line config)
+            existing_mgmt_secret = config_mgr.config.get('management_api', {}).get('client_secret', '') or config_mgr.config.get('client_secret', '')
+            existing_server_secret = config_mgr.config.get('server_client', {}).get('client_secret', '')
 
             config_to_save = {
                 'domain': config['domain'],
                 'issuer': f"https://{config['domain']}",
                 'audience': config['api_identifier'],
+                'api_identifier': config['api_identifier'],
+                'deployment_name': deployment_name,
+                'api_name': config['api_name'],
                 'connection_id': connection_id,
                 'dcr_enabled': args.use_dcr,
                 'connection_promoted': True
