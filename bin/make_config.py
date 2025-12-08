@@ -48,6 +48,9 @@ def determine_defaults(repo_root: Path) -> dict[str, str]:
 
     if branch in {"master", "main"}:
         tag = git_output(["git", "describe", "--tags", "--abbrev=0"]) or short_sha
+        # Ensure tag has 'v' prefix (e.g., v3.0.0 not 3.0.0)
+        if tag and not tag.startswith("v") and tag[0].isdigit():
+            tag = f"v{tag}"
     else:
         tag = f"{sanitized_branch}-{short_sha}"
 
