@@ -27,7 +27,7 @@
     "source=${localEnv:HOME}${localEnv:USERPROFILE}/.vscode-projects/${localWorkspaceFolderBasename}/kube-cache,target=/home/vscode/.kube/cache,type=bind,consistency=cached"
   ],
 
-  "initializeCommand": "bash -lc '.devcontainer/init.sh ${localEnv:HOME}${localEnv:USERPROFILE}/.vscode-projects/${localWorkspaceFolderBasename}'"
+  "initializeCommand": "bash -lc '.devcontainer/init.sh ${localEnv:HOME}${localEnv:USERPROFILE}/.vscode-projects/${localWorkspaceFolderBasename}'",
 
   // Features to add to the dev container. More info: https://containers.dev/features.
   // "features": {},
@@ -36,7 +36,7 @@
   // "forwardPorts": [],
 
   // Use 'postCreateCommand' to run commands after the container is created.
-  "postCreateCommand": "bash .devcontainer/post-create.sh"
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
 
   // Configure tool-specific properties.
   // "customizations": {},

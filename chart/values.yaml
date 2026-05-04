@@ -1,0 +1,282 @@
+# Default values for cnpg-mcp.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+
+image:
+  repository: your-registry.example.com/cnpg-mcp
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: "cnpg-mcp"
+
+podAnnotations: {}
+
+podSecurityContext: {}
+  # fsGroup: 2000
+
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #   - ALL
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+service:
+  type: ClusterIP
+  port: 4200
+  # Test sidecar port (only used when testSidecar.enabled = true)
+  testPort: 4201
+
+# Test Sidecar Configuration
+# Runs the test server with --no-auth. Reachable ClusterIP-only / via
+# port-forward; never exposed through Ingress.
+testSidecar:
+  # Enable test sidecar container
+  enabled: false
+
+  # Image for the test sidecar. The default (empty repository) makes the
+  # deployment template auto-derive a test image name from image.repository
+  # by replacing the trailing "-server" suffix with "-test-server":
+  #
+  #   image.repository: wateim/myproj-server
+  #   → testSidecar image: wateim/myproj-test-server
+  #
+  # The test image is built by `make build-test` and is FROM the main image,
+  # adding only the *_test_server.py entrypoint. The sidecar MUST run this
+  # test image — the main image doesn't include the test server file by
+  # design (clean separation of test-only artifacts).
+  #
+  # Override repository explicitly if your registry uses a different naming
+  # convention, e.g.:
+  #   testSidecar:
+  #     image:
+  #       repository: wateim/some-other-test-image
+  image:
+    repository: ""  # empty → derive from image.repository (s/-server$/-test-server/)
+    tag: ""         # empty → use image.tag
+    pullPolicy: ""  # empty → use image.pullPolicy
+
+  # Mock identity injected by NoAuthMiddleware. Becomes both the `sub` and
+  # `preferred_username` claims; the issuer is fixed at http://localhost/no-auth.
+  identity: "test-user"
+
+  # Resource limits for test sidecar
+  resources: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+  # Single hostname for this MCP server
+  host: "chart-example.local"
+  # Path for the MCP endpoint (usually /)
+  path: /
+  pathType: ImplementationSpecific
+  # TLS configuration
+  tls:
+    enabled: false
+    secretName: ""
+
+resources: {}
+  # limits:
+  #   cpu: 100m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# JWT Signing Key Secret — Pattern A only.
+# Set jwt.enabled: false for Pattern B (Keycloak native DCR) deployments.
+jwt:
+  # Whether to mount a JWT signing key / storage encryption key Secret.
+  # Required for Pattern A (auth0, oidc). Must be false for Pattern B (keycloak).
+  enabled: true
+
+  # Name of the Kubernetes secret containing the JWT signing key
+  # Secret should have keys: jwt-signing-key, storage-encryption-key
+  # Default: {{ .Release.Name }}-jwt-signing-key
+  secretName: ""  # Leave empty to use default
+
+# OIDC/OAuth2 Authentication Configuration
+# REQUIRED for production HTTP mode deployment.
+# See mcp-base docs/cli-integration-contract.md for the full schema and pattern split.
+oidc:
+  # REQUIRED: Authentication type. Drives Pattern A vs Pattern B chart branches.
+  # You MUST set this to match the auth_type the scaffold was generated with —
+  # the entry point hard-codes the branch, the chart only configures it.
+  #
+  #   "keycloak" — FastMCP KeycloakAuthProvider (Pattern B; recommended for
+  #                MCP clients like Codex / Claude Desktop). Keycloak serves DCR
+  #                natively; no client_secret, JWT signing key, or Redis required.
+  #                Requires Keycloak >= 26.6.0 and fastmcp >= 3.2.4.
+  #                NOTE: Add `offline_access` to the realm's default client
+  #                scopes or DCR-registered MCP clients will receive no
+  #                refresh token (access tokens silently expire after ~5 min).
+  #   "auth0"    — FastMCP Auth0Provider OAuth proxy (Pattern A: local DCR,
+  #                Redis-backed sessions, JWT signing key required).
+  #   "oidc"     — generic OIDC middleware for other IdPs (Dex, Okta, Azure AD).
+  #                Pattern A; same Redis / JWT signing key requirements as auth0.
+  #                Publishes RFC 9728 / RFC 8414 / OIDC Discovery at the standard,
+  #                path-prefixed, and path-suffixed URL variants MCP clients probe.
+  authType: "keycloak"
+
+  # REQUIRED: OIDC Issuer URL (base URL of your identity provider).
+  # For Keycloak, this is the realm URL.
+  # Examples:
+  #   https://keycloak.example.com/realms/your-realm
+  #   https://your-org.okta.com/oauth2/default
+  #   https://login.microsoftonline.com/{tenant-id}/v2.0
+  issuer: "https://your-issuer.example.com"
+
+  # REQUIRED: Expected audience claim in JWT tokens
+  audience: "https://your-api.example.com/mcp"
+
+  # REQUIRED for Pattern A. Ignored for Pattern B.
+  clientId: ""
+
+  # OPTIONAL (Pattern B): OAuth2 scopes required on incoming tokens.
+  # requiredScopes: ["openid"]
+
+  # OPTIONAL: Public URL of this MCP server (for OAuth callbacks)
+  # If not set, auto-generated from ingress.host
+  publicUrl: ""
+
+  # OPTIONAL (Pattern A): credentials secret override
+  # Default: {{ .Release.Name }}-oidc-credentials
+  credentialsSecretName: ""
+
+  # OPTIONAL (Pattern A): client secret key inside the credentials secret
+  clientSecretKey: ""
+
+  # OPTIONAL: Override JWKS URI (auto-discovered from issuer by default)
+  # jwksUri: ""
+
+  # OPTIONAL: Required OAuth2 scope (default: openid)
+  # scope: "openid"
+
+# Operator RBAC Configuration
+# The chart creates namespaced permissions for CloudNativePG clusters,
+# Database CRDs, and role/database secrets. Add ClusterRole names here only
+# when your operator installation provides extra roles you also want bound.
+rbac:
+  operatorClusterRoles: []
+
+# Prompt Management Configuration
+# Prompts are loaded from a ConfigMap and can be hot-reloaded
+prompts:
+  # Enable prompt management
+  enabled: true
+
+  # Prompt bundle version (semver)
+  version: "1.0.0"
+
+  # Prompt definitions
+  # Customize or replace these with your own prompts
+  definitions:
+    - id: "example-prompt"
+      name: "Example Prompt"
+      description: "An example prompt template"
+      template: |
+        This is an example prompt for cnpg-mcp.
+
+        User Input: {{ input }}"
+
+        Please process this request according to the server's capabilities.
+      arguments:
+        - name: input
+          description: "User input to process"
+          required: true
+
+# Redis Configuration
+# Used for OAuth session persistence across restarts
+redis:
+  # Enable Redis deployment
+  enabled: true
+
+  # Redis architecture (standalone, replication, or cluster)
+  architecture: standalone
+
+  # Number of replicas (only for replication/cluster modes)
+  replicaCount: 1
+
+  # Redis server configuration
+  master:
+    configuration: |
+      maxmemory 256mb
+      maxmemory-policy allkeys-lru
+
+  # Redis resources
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  # Persistence configuration
+  persistence:
+    enabled: true
+    storageClass: ""  # Use default storage class
+    accessMode: ReadWriteOnce
+    size: 1Gi
+
+  # Pod security context
+  podSecurityContext:
+    fsGroup: 999
+    runAsUser: 999
+    runAsGroup: 999
+    runAsNonRoot: true
+
+  # Container security context
+  containerSecurityContext:
+    runAsUser: 999
+    runAsGroup: 999
+    runAsNonRoot: true
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
+
+  # Service configuration
+  service:
+    type: ClusterIP
+    port: 6379
+
+  # Authentication
+  auth:
+    enabled: false
+    password: ""

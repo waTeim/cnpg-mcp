@@ -1,0 +1,12 @@
+{{- $fullName := include "cnpg-mcp.fullname" . -}}
+1. Get the application URL by running these commands:
+{{- if .Values.ingress.enabled }}
+  http{{- if .Values.ingress.tls.enabled }}s{{- end }}://{{ .Values.ingress.host }}
+{{- else if contains "NodePort" .Values.service.type }}
+  export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ $fullName }})
+  export NODE_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo http://$NODE_IP:$NODE_PORT
+{{- else if contains "ClusterIP" .Values.service.type }}
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ $fullName }} 4200:4200
+  echo "Visit http://127.0.0.1:4200/mcp"
+{{- end }}
