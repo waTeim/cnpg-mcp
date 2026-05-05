@@ -1,0 +1,82 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cnpg-mcp.fullname" . }}-oidc-config
+  labels:
+    {{- include "cnpg-mcp.labels" . | nindent 4 }}
+data:
+  oidc.yaml: |
+    # FastMCP OAuth Proxy Configuration for Auth0
+    # Auto-generated from Helm values
+    #
+    # The MCP server uses FastMCP's built-in OAuth Proxy to handle token issuance:
+    # - Receives Auth0 tokens internally (may be JWE encrypted)
+    # - Issues MCP-signed JWT tokens to clients (NOT Auth0 tokens)
+    # - Manages session binding between Auth0 and MCP tokens
+
+    # ========================================================================
+    # REQUIRED: Auth0 Configuration
+    # ========================================================================
+
+    # Auth0 domain (OIDC issuer URL)
+    issuer: {{ .Values.oidc.issuer | quote }}
+
+    # API identifier (expected audience claim in tokens)
+    audience: {{ .Values.oidc.audience | quote }}
+
+    # Auth0 application client ID (pre-registered application)
+    client_id: {{ .Values.oidc.clientId | quote }}
+
+    # Path to server client secret file (mounted from Kubernetes Secret)
+    # Secret name: {{ .Release.Name }}-auth0-credentials
+    # Secret key: server-client-secret
+    # FastMCP Auth0Provider uses this to authenticate with Auth0 during token exchange
+    client_secret_file: "/etc/mcp/secrets/auth0/server-client-secret"
+
+    # Path to JWT signing key file (mounted from Kubernetes Secret)
+    # Secret name: {{ .Values.jwt.secretName | default (printf "%s-jwt-signing-key" .Release.Name) }}
+    # Secret key: jwt-signing-key
+    # Used to sign MCP tokens issued to clients (required for multi-replica deployments)
+    jwt_signing_key_file: "/etc/mcp/secrets/jwt-signing-key"
+
+    # Path to storage encryption key file (mounted from Kubernetes Secret)
+    # Secret name: {{ .Values.jwt.secretName | default (printf "%s-jwt-signing-key" .Release.Name) }}
+    # Secret key: storage-encryption-key
+    # Used to encrypt OAuth tokens stored in Redis (required for multi-replica deployments)
+    storage_encryption_key_file: "/etc/mcp/secrets/storage-encryption-key"
+
+    # ========================================================================
+    # REQUIRED: Server Configuration
+    # ========================================================================
+
+    {{- if and .Values.ingress.enabled .Values.ingress.host }}
+    # Public URL of this MCP server (derived from ingress configuration)
+    # Used for OAuth callbacks and metadata endpoints
+    public_url: {{ if .Values.ingress.tls.enabled }}"https://{{ .Values.ingress.host }}"{{ else }}"http://{{ .Values.ingress.host }}"{{ end }}
+    {{- end }}
+
+    # ========================================================================
+    # OPTIONAL: Advanced Configuration
+    # ========================================================================
+
+    {{- if .Values.oidc.jwksUri }}
+    # Override JWKS URI (auto-discovered from issuer by default)
+    jwks_uri: {{ .Values.oidc.jwksUri | quote }}
+    {{- end }}
+
+    {{- if .Values.oidc.scope }}
+    # Required OAuth2 scope (default: openid)
+    scope: {{ .Values.oidc.scope | quote }}
+    {{- end }}
+
+    # ========================================================================
+    # Redis Configuration (OAuth Session Persistence)
+    # ========================================================================
+    {{- if .Values.redis.enabled }}
+    # Redis configuration for OAuth session persistence across restarts
+    # Without Redis, OAuth sessions are stored in-memory and lost on pod restart
+    redis:
+      host: "{{ .Release.Name }}-redis"
+      port: {{ .Values.redis.service.port | default 6379 }}
+      db: 0
+    {{- end }}

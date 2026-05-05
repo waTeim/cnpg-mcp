@@ -53,7 +53,7 @@ def load_oidc_config_from_file(config_path: Optional[str] = None) -> Optional[Di
 
     # Standard Kubernetes ConfigMap/Secret mount paths
     search_paths.extend([
-        "/etc/mcp/oidc.yaml",
+        "/etc/mcp/oidc/oidc.yaml",
         "/config/oidc.yaml",
         "./oidc.yaml"
     ])
@@ -80,6 +80,52 @@ def load_oidc_config_from_file(config_path: Optional[str] = None) -> Optional[Di
 
     logger.debug("No OIDC config file found, will use environment variables")
     return None
+
+
+def _normalize_scopes(value: Any) -> list:
+    """Normalize scope config from YAML/env into a list of non-empty strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = value.replace(",", " ").split()
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = []
+        for item in value:
+            if item is None:
+                continue
+            raw_items.extend(str(item).replace(",", " ").split())
+    else:
+        raw_items = str(value).replace(",", " ").split()
+
+    scopes = []
+    for item in raw_items:
+        scope = item.strip()
+        if scope and scope not in scopes:
+            scopes.append(scope)
+    return scopes
+
+
+def _resolve_required_scopes(
+    explicit_scope: Optional[str],
+    config: Dict[str, Any],
+) -> list:
+    """
+    Resolve required scopes from explicit args, config, then env.
+
+    Supports `required_scopes`, legacy singular `scope`,
+    `OIDC_REQUIRED_SCOPES`, and `OIDC_SCOPE`.
+    """
+    for source in (
+        explicit_scope,
+        config.get("required_scopes"),
+        config.get("scope"),
+        os.getenv("OIDC_REQUIRED_SCOPES"),
+        os.getenv("OIDC_SCOPE"),
+    ):
+        scopes = _normalize_scopes(source)
+        if scopes:
+            return scopes
+    return []
 
 
 class JWKSCache:
@@ -136,7 +182,7 @@ class OIDCAuthProvider:
         OIDC_AUDIENCE: Expected audience claim in JWT (e.g., mcp-api)
         OIDC_JWKS_URI: Optional override for JWKS URI
         DCR_PROXY_URL: Optional DCR proxy URL for client registration
-        OIDC_SCOPE: Required scope (default: openid)
+        OIDC_REQUIRED_SCOPES/OIDC_SCOPE: Required token scope(s)
     """
 
     def __init__(
@@ -146,9 +192,10 @@ class OIDCAuthProvider:
         jwks_uri: Optional[str] = None,
         dcr_proxy_url: Optional[str] = None,
         public_url: Optional[str] = None,
-        required_scope: str = "openid",
+        required_scope: Optional[str] = None,
         config_path: Optional[str] = None,
-        client_secrets: Optional[list] = None
+        client_secrets: Optional[list] = None,
+        resource_path: str = "/mcp",
     ):
         """
         Initialize OIDC authentication provider.
@@ -165,12 +212,17 @@ class OIDCAuthProvider:
             jwks_uri: JWKS URI (overrides auto-discovery)
             dcr_proxy_url: DCR proxy URL for client registration
             public_url: Public URL of this server for OAuth metadata (overrides config file and env var)
-            required_scope: Required OAuth2 scope (default: openid)
+            required_scope: Required OAuth2 scope(s)
             config_path: Optional path to OIDC config file (YAML)
             client_secrets: List of client_secrets to try for JWE decryption (Auth0 compatibility)
+            resource_path: HTTP path the MCP transport is mounted at. Used to
+                publish the path-scoped and path-prefixed RFC 9728 / RFC 8615
+                discovery variants that MCP clients probe (e.g. `/mcp`).
         """
         # Try to load from config file first
         config = load_oidc_config_from_file(config_path) or {}
+
+        self.resource_path = "/" + (resource_path or "/mcp").strip("/")
 
         # Priority: explicit params > config file > env vars
         self.issuer = issuer or config.get("issuer") or os.getenv("OIDC_ISSUER")
@@ -196,18 +248,24 @@ class OIDCAuthProvider:
             except Exception as e:
                 logger.warning(f"Could not load management secret from file: {e}")
 
-        # Don't require scope by default - M2M tokens typically don't have 'openid' scope
-        self.required_scope = required_scope or config.get("scope") or os.getenv("OIDC_SCOPE")
+        # Don't require scope by default. Helm-rendered config can set
+        # required_scopes/scope, and env can set OIDC_REQUIRED_SCOPES/OIDC_SCOPE.
+        self.required_scopes = _resolve_required_scopes(required_scope, config)
+        self.required_scope = self.required_scopes[0] if self.required_scopes else None
 
         # Debug: Show scope configuration sources
         scope_source = "not set (M2M mode)"
         if required_scope:
             scope_source = f"explicit parameter: '{required_scope}'"
+        elif config.get("required_scopes"):
+            scope_source = f"config file required_scopes: '{config.get('required_scopes')}'"
         elif config.get("scope"):
             scope_source = f"config file: '{config.get('scope')}'"
+        elif os.getenv("OIDC_REQUIRED_SCOPES"):
+            scope_source = f"environment: '{os.getenv('OIDC_REQUIRED_SCOPES')}'"
         elif os.getenv("OIDC_SCOPE"):
             scope_source = f"environment: '{os.getenv('OIDC_SCOPE')}'"
-        logger.info(f"🔧 Required scope configuration: {scope_source} -> final value: {self.required_scope}")
+        logger.info(f"🔧 Required scope configuration: {scope_source} -> final value: {self.required_scopes}")
 
         # Validate required configuration
         if not self.issuer:
@@ -701,18 +759,19 @@ class OIDCAuthProvider:
                 )
 
             # Verify scope if required
-            if self.required_scope:
+            if self.required_scopes:
                 scope = claims.get('scope', '')
                 if isinstance(scope, str):
                     scopes = scope.split()
                 else:
-                    scopes = scope
+                    scopes = scope or []
 
-                logger.info(f"🔍 Scope validation: required='{self.required_scope}', token_scopes={scopes}")
+                logger.info(f"🔍 Scope validation: required='{self.required_scopes}', token_scopes={scopes}")
 
-                if self.required_scope not in scopes:
+                missing_scopes = [s for s in self.required_scopes if s not in scopes]
+                if missing_scopes:
                     raise ValueError(
-                        f"Required scope '{self.required_scope}' not found in token. Token has: {scopes}"
+                        f"Required scope(s) {missing_scopes} not found in token. Token has: {scopes}"
                     )
             else:
                 # Log when no scope is required
@@ -836,9 +895,7 @@ class OIDCAuthProvider:
             )
 
             # Build scopes list dynamically
-            scopes_supported = []
-            if self.required_scope:
-                scopes_supported.append(self.required_scope)
+            scopes_supported = list(self.required_scopes)
             # Always include openid for user flows even if not required for M2M
             if "openid" not in scopes_supported:
                 scopes_supported.append("openid")
@@ -1023,12 +1080,15 @@ class OIDCAuthProvider:
                     status_code=500
                 )
 
-        # OAuth Authorization Server metadata (for auth servers like Auth0)
-        routes.append(
-            Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"])
-        )
+        # OpenID Connect Discovery (1.0) — same payload as oauth-authorization-server.
+        # MCP clients (Codex, Claude Desktop) probe this path even when we are
+        # only an OAuth resource server / proxy. Returning the auth-server
+        # metadata satisfies the discovery contract.
+        async def openid_configuration(request):
+            logger.info(f"📋 OpenID configuration requested from {request.url.path}")
+            return await oauth_metadata(request)
 
-        # Protected Resource metadata endpoint (RFC 8707) - for resource servers (us!)
+        # Protected Resource metadata endpoint (RFC 9728) - for resource servers (us!)
         async def protected_resource_metadata(request):
             """
             OAuth 2.0 Protected Resource Metadata (RFC 8707).
@@ -1043,7 +1103,7 @@ class OIDCAuthProvider:
                 "resource": self.audience,  # Our resource identifier
                 "authorization_servers": [advertised_issuer],  # Advertise ourselves as auth server
                 "bearer_methods_supported": ["header"],  # We accept Bearer tokens in Authorization header
-                "scopes_supported": [self.required_scope] if self.required_scope else ["openid"],
+                "scopes_supported": self.required_scopes or ["openid"],
             }
 
             # Include registration endpoint if DCR proxy is enabled
@@ -1062,9 +1122,29 @@ class OIDCAuthProvider:
 
             return JSONResponse(metadata)
 
-        routes.append(
-            Route("/.well-known/oauth-protected-resource", protected_resource_metadata, methods=["GET"])
-        )
+        # MCP clients (Codex, Claude Desktop) probe each discovery spec at
+        # three URL variants — the standard well-known root, the path-suffixed
+        # form (RFC 9728-style resource indicator), and the path-prefixed
+        # form (RFC 8615 §3 well-known under a sub-path). Register every
+        # handler at all three so the client lands on a 200 regardless of
+        # which probe order it uses.
+        resource_path = self.resource_path  # e.g. "/mcp"
+        discovery_specs = [
+            ("oauth-authorization-server", oauth_metadata),
+            ("openid-configuration", openid_configuration),
+            ("oauth-protected-resource", protected_resource_metadata),
+        ]
+        seen_paths = set()
+        for spec, handler in discovery_specs:
+            for path in (
+                f"/.well-known/{spec}",
+                f"/.well-known/{spec}{resource_path}",
+                f"{resource_path}/.well-known/{spec}",
+            ):
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                routes.append(Route(path, handler, methods=["GET"]))
 
         # Add DCR endpoint if configured
         if self.upstream_dcr_endpoint:

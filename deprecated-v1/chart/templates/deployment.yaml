@@ -1,0 +1,171 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cnpg-mcp.fullname" . }}
+  labels:
+    {{- include "cnpg-mcp.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "cnpg-mcp.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "cnpg-mcp.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "cnpg-mcp.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+
+          # Mount OIDC configuration as volume
+          volumeMounts:
+            # Always mount ConfigMap for OIDC config
+            - name: oidc-config
+              mountPath: /etc/mcp
+              readOnly: true
+            # Mount Auth0 credentials secret
+            - name: auth0-credentials
+              mountPath: /etc/mcp/secrets/auth0
+              readOnly: true
+            # Mount JWT signing key secret
+            - name: jwt-signing-key
+              mountPath: /etc/mcp/secrets
+              readOnly: true
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+        {{- if .Values.testSidecar.enabled }}
+        # Test sidecar container using OIDC authentication
+        - name: {{ .Chart.Name }}-test
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.testSidecar.image.repository | default .Values.image.repository }}:{{ .Values.testSidecar.image.tag | default (.Values.image.tag | default (printf "v%s" .Chart.AppVersion)) }}"
+          imagePullPolicy: {{ .Values.testSidecar.image.pullPolicy | default .Values.image.pullPolicy }}
+          command: ["python", "cnpg_mcp_test_server.py"]
+          args: ["--port", "{{ .Values.service.testPort }}"]
+          ports:
+            - name: http-test
+              containerPort: {{ .Values.service.testPort }}
+              protocol: TCP
+
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+
+          # Mount OIDC configuration as volume (shared with main container)
+          volumeMounts:
+            - name: oidc-config
+              mountPath: /etc/mcp
+              readOnly: true
+            - name: auth0-credentials
+              mountPath: /etc/mcp/secrets/auth0
+              readOnly: true
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http-test
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http-test
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          resources:
+            {{- toYaml .Values.testSidecar.resources | nindent 12 }}
+        {{- end }}
+
+      # Define volumes for OIDC configuration
+      volumes:
+        # Always use ConfigMap for OIDC config (non-sensitive)
+        - name: oidc-config
+          configMap:
+            name: {{ include "cnpg-mcp.fullname" . }}-oidc-config
+            items:
+              - key: oidc.yaml
+                path: oidc.yaml
+        # Mount Auth0 credentials secret (derived from release name)
+        - name: auth0-credentials
+          secret:
+            secretName: {{ .Release.Name }}-auth0-credentials
+            items:
+              - key: server-client-secret
+                path: server-client-secret
+        # Mount JWT signing key and storage encryption key secret
+        - name: jwt-signing-key
+          secret:
+            secretName: {{ .Values.jwt.secretName | default (printf "%s-jwt-signing-key" .Release.Name) }}
+            items:
+              - key: jwt-signing-key
+                path: jwt-signing-key
+              - key: storage-encryption-key
+                path: storage-encryption-key
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

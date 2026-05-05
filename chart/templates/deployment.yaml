@@ -31,7 +31,7 @@ spec:
         - name: {{ .Chart.Name }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}"
+          image: '{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}'
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
@@ -41,21 +41,35 @@ spec:
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
+            {{- if .Values.prompts.enabled }}
+            - name: PROMPTS_PATH
+              value: "/etc/mcp/prompts/prompts.yaml"
+            {{- end }}
 
-          # Mount OIDC configuration as volume
+          # Mount configuration volumes
           volumeMounts:
             # Always mount ConfigMap for OIDC config
             - name: oidc-config
-              mountPath: /etc/mcp
+              mountPath: /etc/mcp/oidc
               readOnly: true
-            # Mount Auth0 credentials secret
-            - name: auth0-credentials
-              mountPath: /etc/mcp/secrets/auth0
+            {{- if ne .Values.oidc.authType "keycloak" }}
+            # Pattern A — client credentials secret
+            - name: oidc-credentials
+              mountPath: /etc/mcp/secrets/oidc
               readOnly: true
-            # Mount JWT signing key secret
+            {{- end }}
+            {{- if and (ne .Values.oidc.authType "keycloak") .Values.jwt.enabled }}
+            # Pattern A — JWT signing key + storage encryption key
             - name: jwt-signing-key
               mountPath: /etc/mcp/secrets
               readOnly: true
+            {{- end }}
+            {{- if .Values.prompts.enabled }}
+            # Mount prompts ConfigMap (hot-reloadable)
+            - name: prompts
+              mountPath: /etc/mcp/prompts
+              readOnly: true
+            {{- end }}
 
           livenessProbe:
             httpGet:
@@ -81,14 +95,37 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
 
         {{- if .Values.testSidecar.enabled }}
-        # Test sidecar container using OIDC authentication
+        # Test sidecar container — runs the test server in --no-auth mode.
+        # Authentication is disabled; identity (sub/iss) is supplied to the
+        # NoAuthMiddleware via --identity so user_hash + mcp_context still work.
+        # The Service exposes this port as ClusterIP only and the Ingress does
+        # NOT route to it, so it is reachable only inside the cluster or via
+        # `kubectl port-forward`.
+        #
+        # IMAGE DERIVATION: the sidecar must run the *test* image (which
+        # contains the *_test_server.py entrypoint), not the main image.
+        # If testSidecar.image.repository is empty (the default), derive the
+        # test image from .Values.image.repository by replacing the trailing
+        # "-server" suffix with "-test-server". Examples:
+        #   wateim/myproj-server  →  wateim/myproj-test-server
+        # Set testSidecar.image.repository explicitly to override.
+        {{- $testImageRepo := .Values.testSidecar.image.repository | default (regexReplaceAll "-server$" .Values.image.repository "-test-server") }}
+        {{- $testImageTag := .Values.testSidecar.image.tag | default (.Values.image.tag | default (printf "v%s" .Chart.AppVersion)) }}
+        {{- $testImagePullPolicy := .Values.testSidecar.image.pullPolicy | default .Values.image.pullPolicy }}
         - name: {{ .Chart.Name }}-test
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.testSidecar.image.repository | default .Values.image.repository }}:{{ .Values.testSidecar.image.tag | default (.Values.image.tag | default (printf "v%s" .Chart.AppVersion)) }}"
-          imagePullPolicy: {{ .Values.testSidecar.image.pullPolicy | default .Values.image.pullPolicy }}
+          image: '{{ $testImageRepo }}:{{ $testImageTag }}'
+          imagePullPolicy: {{ $testImagePullPolicy }}
           command: ["python", "cnpg_mcp_test_server.py"]
-          args: ["--port", "{{ .Values.service.testPort }}"]
+          args:
+            - "--no-auth"
+            - "--identity"
+            - {{ .Values.testSidecar.identity | default "test-user" | quote }}
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - {{ .Values.service.testPort | quote }}
           ports:
             - name: http-test
               containerPort: {{ .Values.service.testPort }}
@@ -98,14 +135,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
 
-          # Mount OIDC configuration as volume (shared with main container)
-          volumeMounts:
-            - name: oidc-config
-              mountPath: /etc/mcp
-              readOnly: true
-            - name: auth0-credentials
-              mountPath: /etc/mcp/secrets/auth0
-              readOnly: true
+          # No OIDC config or credentials — the test sidecar runs in --no-auth.
 
           livenessProbe:
             httpGet:
@@ -140,14 +170,17 @@ spec:
             items:
               - key: oidc.yaml
                 path: oidc.yaml
-        # Mount Auth0 credentials secret (derived from release name)
-        - name: auth0-credentials
+        {{- if ne .Values.oidc.authType "keycloak" }}
+        # Pattern A — client credentials secret
+        - name: oidc-credentials
           secret:
-            secretName: {{ .Release.Name }}-auth0-credentials
+            secretName: {{ .Values.oidc.credentialsSecretName | default (printf "%s-oidc-credentials" .Release.Name) }}
             items:
-              - key: server-client-secret
-                path: server-client-secret
-        # Mount JWT signing key and storage encryption key secret
+              - key: {{ .Values.oidc.clientSecretKey | default "server-client-secret" }}
+                path: {{ .Values.oidc.clientSecretKey | default "server-client-secret" }}
+        {{- end }}
+        {{- if and (ne .Values.oidc.authType "keycloak") .Values.jwt.enabled }}
+        # Pattern A — JWT signing key + storage encryption key
         - name: jwt-signing-key
           secret:
             secretName: {{ .Values.jwt.secretName | default (printf "%s-jwt-signing-key" .Release.Name) }}
@@ -156,6 +189,13 @@ spec:
                 path: jwt-signing-key
               - key: storage-encryption-key
                 path: storage-encryption-key
+        {{- end }}
+        {{- if .Values.prompts.enabled }}
+        # Mount prompts ConfigMap
+        - name: prompts
+          configMap:
+            name: {{ include "cnpg-mcp.fullname" . }}-prompts
+        {{- end }}
 
       {{- with .Values.nodeSelector }}
       nodeSelector:

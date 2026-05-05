@@ -1,5 +1,5 @@
 # Core MCP Server dependencies
-fastmcp>=2.0.0  # MCP server framework
+fastmcp>=3.2.4  # MCP server framework (3.2.4+ ships the Keycloak provider)
 py-key-value-aio[redis]  # Redis storage backend for OAuth session persistence
 
 # Kubernetes client

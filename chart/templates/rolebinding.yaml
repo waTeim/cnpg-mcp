@@ -1,52 +1,28 @@
+{{- $targetNamespaces := list .Release.Namespace -}}
+{{- range .Values.rbac.targetNamespaces }}
+{{- $targetNamespaces = append $targetNamespaces . -}}
+{{- end }}
+{{- if .Values.rbac.clusterWide }}
+# Cluster-wide permissions for CloudNativePG resources and managed secrets.
+# This is intentionally opt-in because it grants secret access across namespaces.
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: {{ include "cnpg-mcp.fullname" . }}-cnpg-view
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "cnpg-mcp.labels" . | nindent 4 }}
-subjects:
-  - kind: ServiceAccount
-    name: {{ include "cnpg-mcp.serviceAccountName" . }}
-    namespace: {{ .Release.Namespace }}
-roleRef:
-  kind: ClusterRole
-  name: cnpg-cloudnative-pg-view
-  apiGroup: rbac.authorization.k8s.io
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: {{ include "cnpg-mcp.fullname" . }}-cnpg-edit
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "cnpg-mcp.labels" . | nindent 4 }}
-subjects:
-  - kind: ServiceAccount
-    name: {{ include "cnpg-mcp.serviceAccountName" . }}
-    namespace: {{ .Release.Namespace }}
-roleRef:
-  kind: ClusterRole
-  name: cnpg-cloudnative-pg-edit
-  apiGroup: rbac.authorization.k8s.io
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   name: {{ include "cnpg-mcp.fullname" . }}-secrets
-  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "cnpg-mcp.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters", "databases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
   name: {{ include "cnpg-mcp.fullname" . }}-secrets
-  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "cnpg-mcp.labels" . | nindent 4 }}
 subjects:
@@ -54,6 +30,79 @@ subjects:
     name: {{ include "cnpg-mcp.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 roleRef:
-  kind: Role
+  kind: ClusterRole
   name: {{ include "cnpg-mcp.fullname" . }}-secrets
   apiGroup: rbac.authorization.k8s.io
+{{- range .Values.rbac.operatorClusterRoles }}
+---
+# Optional cluster-wide binding to an operator-provided ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "cnpg-mcp.fullname" $ }}-{{ . }}
+  labels:
+    {{- include "cnpg-mcp.labels" $ | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cnpg-mcp.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ . }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- else }}
+{{- range $namespace := uniq $targetNamespaces }}
+# Namespaced permissions for CloudNativePG resources and managed secrets
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "cnpg-mcp.fullname" $ }}-secrets
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "cnpg-mcp.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters", "databases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "cnpg-mcp.fullname" $ }}-secrets
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "cnpg-mcp.labels" $ | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cnpg-mcp.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "cnpg-mcp.fullname" $ }}-secrets
+  apiGroup: rbac.authorization.k8s.io
+{{- range $.Values.rbac.operatorClusterRoles }}
+---
+# Optional binding to an operator-provided ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "cnpg-mcp.fullname" $ }}-{{ . }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "cnpg-mcp.labels" $ | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cnpg-mcp.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ . }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+---
+{{- end }}
+{{- end }}

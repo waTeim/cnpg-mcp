@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
-CloudNativePG MCP Test Server (OIDC Auth)
+cnpg-mcp MCP Test Server (OIDC Auth or No-Auth Mode)
 
-Test endpoint for the CloudNativePG MCP server using standard OIDC authentication.
-This server accepts Auth0 JWT tokens directly (no MCP token issuance).
+Test endpoint for the cnpg-mcp MCP server using standard OIDC authentication
+or no-auth mode for development/testing.
 
 This is deployed as a sidecar container alongside the main FastMCP OAuth server,
 allowing both authentication methods to coexist:
-- Main server (port 3000): FastMCP OAuth proxy issuing MCP tokens
-- Test server (port 3001): Standard OIDC accepting Auth0 JWT tokens
+- Main server (port 4200): FastMCP OAuth proxy issuing MCP tokens
+- Test server (port 4201): Standard OIDC accepting Auth0 JWT tokens
 
-Both servers share the same 12 tool implementations from cnpg_tools.py.
+Both servers share the same tool implementations from cnpg_mcp_tools.py.
+
+No-Auth Mode:
+  For development and testing without authentication:
+    python cnpg_mcp_test_server.py --no-auth --port 4201
+
+  This injects a mock user identity for tools that require user context.
 """
 
 import argparse
@@ -25,25 +31,13 @@ warnings.filterwarnings("ignore", message=".*HTTPResponse.getheaders.*")
 
 from fastmcp import FastMCP, Context
 import uvicorn
-from starlette.middleware import Middleware
 from starlette.routing import Route
 from starlette.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 
-# Import shared tools
-from cnpg_tools import (
-    list_postgres_clusters,
-    get_cluster_status,
-    create_postgres_cluster,
-    scale_postgres_cluster,
-    delete_postgres_cluster,
-    list_postgres_roles,
-    create_postgres_role,
-    update_postgres_role,
-    delete_postgres_role,
-    list_postgres_databases,
-    create_postgres_database,
-    delete_postgres_database,
-)
+# Import shared tools and resources registration
+from cnpg_mcp_tools import register_tools, register_resources
 
 # Import OIDC auth
 from auth_oidc import OIDCAuthProvider, OIDCAuthMiddleware
@@ -56,201 +50,37 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Set log levels for external libraries
+# Suppress noisy loggers
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+# Custom filter to exclude health check endpoints from access logs
+class HealthCheckFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Exclude health check paths from access logs
+        return not any(path in record.getMessage() for path in ["/healthz", "/readyz", "/health"])
 
 # ============================================================================
 # FastMCP Server Initialization
 # ============================================================================
 
-mcp = FastMCP("cloudnative-pg-test")
+mcp = FastMCP(
+    "cnpg-mcp-test",
+    instructions="""
+cnpg-mcp MCP Test Server (OIDC Auth).
+
+This is the test server endpoint that accepts Auth0 JWT tokens directly.
+Use this for testing with standard OIDC authentication.
+"""
+)
 
 # ============================================================================
-# Register Tools
+# Register Resources and Tools
 # ============================================================================
 
-# Register all 12 tools by decorating the imported functions
-# These are the same tool implementations used by the main server
+register_resources(mcp)
+register_tools(mcp)
 
-@mcp.tool(name="list_postgres_clusters")
-async def list_postgres_clusters_tool(
-    namespace: str = None,
-    detail_level: str = "concise",
-    format: str = "text",
-    ctx: Context = None
-):
-    """List all PostgreSQL clusters managed by CloudNativePG."""
-    return await list_postgres_clusters(ctx, namespace=namespace, detail_level=detail_level, format=format)
-
-
-@mcp.tool(name="get_cluster_status")
-async def get_cluster_status_tool(
-    name: str,
-    namespace: str = None,
-    detail_level: str = "concise",
-    format: str = "text",
-    ctx: Context = None
-):
-    """Get detailed status of a specific PostgreSQL cluster."""
-    return await get_cluster_status(ctx, name=name, namespace=namespace, detail_level=detail_level, format=format)
-
-
-@mcp.tool(name="create_postgres_cluster")
-async def create_postgres_cluster_tool(
-    name: str,
-    instances: int = 3,
-    storage_size: str = "10Gi",
-    postgres_version: str = "16",
-    storage_class: str = None,
-    wait: bool = False,
-    timeout: int = None,
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Create a new PostgreSQL cluster with high availability configuration."""
-    return await create_postgres_cluster(
-        ctx, name=name, instances=instances, storage_size=storage_size,
-        postgres_version=postgres_version, storage_class=storage_class,
-        wait=wait, timeout=timeout, namespace=namespace, dry_run=dry_run
-    )
-
-
-@mcp.tool(name="scale_postgres_cluster")
-async def scale_postgres_cluster_tool(
-    name: str,
-    instances: int,
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Scale a PostgreSQL cluster by changing the number of instances."""
-    return await scale_postgres_cluster(ctx, name=name, instances=instances, namespace=namespace, dry_run=dry_run)
-
-
-@mcp.tool(name="delete_postgres_cluster")
-async def delete_postgres_cluster_tool(
-    name: str,
-    confirm_deletion: bool = False,
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Delete a PostgreSQL cluster."""
-    return await delete_postgres_cluster(ctx, name=name, confirm_deletion=confirm_deletion, namespace=namespace, dry_run=dry_run)
-
-
-@mcp.tool(name="list_postgres_roles")
-async def list_postgres_roles_tool(
-    cluster_name: str,
-    namespace: str = None,
-    format: str = "text",
-    ctx: Context = None
-):
-    """List all PostgreSQL roles (users) in a cluster."""
-    return await list_postgres_roles(ctx, cluster_name=cluster_name, namespace=namespace, format=format)
-
-
-@mcp.tool(name="create_postgres_role")
-async def create_postgres_role_tool(
-    cluster_name: str,
-    role_name: str,
-    login: bool = True,
-    superuser: bool = False,
-    inherit: bool = True,
-    createdb: bool = False,
-    createrole: bool = False,
-    replication: bool = False,
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Create a new PostgreSQL role (user) with auto-generated password."""
-    return await create_postgres_role(
-        ctx, cluster_name=cluster_name, role_name=role_name, login=login,
-        superuser=superuser, inherit=inherit, createdb=createdb,
-        createrole=createrole, replication=replication, namespace=namespace, dry_run=dry_run
-    )
-
-
-@mcp.tool(name="update_postgres_role")
-async def update_postgres_role_tool(
-    cluster_name: str,
-    role_name: str,
-    login: bool = None,
-    superuser: bool = None,
-    inherit: bool = None,
-    createdb: bool = None,
-    createrole: bool = None,
-    replication: bool = None,
-    password: str = None,
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Update an existing PostgreSQL role's attributes and optionally reset password."""
-    return await update_postgres_role(
-        ctx, cluster_name=cluster_name, role_name=role_name, login=login,
-        superuser=superuser, inherit=inherit, createdb=createdb,
-        createrole=createrole, replication=replication, password=password,
-        namespace=namespace, dry_run=dry_run
-    )
-
-
-@mcp.tool(name="delete_postgres_role")
-async def delete_postgres_role_tool(
-    cluster_name: str,
-    role_name: str,
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Delete a PostgreSQL role and its associated secret."""
-    return await delete_postgres_role(ctx, cluster_name=cluster_name, role_name=role_name, namespace=namespace, dry_run=dry_run)
-
-
-@mcp.tool(name="list_postgres_databases")
-async def list_postgres_databases_tool(
-    cluster_name: str,
-    namespace: str = None,
-    format: str = "text",
-    ctx: Context = None
-):
-    """List all databases managed by Database CRDs."""
-    return await list_postgres_databases(ctx, cluster_name=cluster_name, namespace=namespace, format=format)
-
-
-@mcp.tool(name="create_postgres_database")
-async def create_postgres_database_tool(
-    cluster_name: str,
-    database_name: str,
-    owner: str,
-    reclaim_policy: str = "retain",
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Create a new database using Database CRD."""
-    return await create_postgres_database(
-        ctx, cluster_name=cluster_name, database_name=database_name, owner=owner,
-        reclaim_policy=reclaim_policy, namespace=namespace, dry_run=dry_run
-    )
-
-
-@mcp.tool(name="delete_postgres_database")
-async def delete_postgres_database_tool(
-    cluster_name: str,
-    database_name: str,
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Delete a Database CRD (actual deletion depends on reclaim policy)."""
-    return await delete_postgres_database(ctx, cluster_name=cluster_name, database_name=database_name, namespace=namespace, dry_run=dry_run)
-
-
-logger.info("✅ Registered 12 tools with test MCP server")
+logger.info("Resources and tools registered with test MCP server")
 
 # ============================================================================
 # Health Check Endpoints
@@ -267,53 +97,215 @@ async def readiness_check(request):
 
 
 # ============================================================================
+# No-Auth Middleware (for development/testing)
+# ============================================================================
+
+class NoAuthMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware that injects mock user claims for no-auth testing mode.
+
+    This allows testing MCP server functionality without requiring
+    actual OIDC authentication. The identity is provided via command-line.
+    """
+
+    def __init__(self, app, identity: str, exclude_paths: list = None):
+        """
+        Initialize NoAuth middleware.
+
+        Args:
+            app: Starlette application
+            identity: Mock user identity to inject
+            exclude_paths: Paths to skip (health checks)
+        """
+        super().__init__(app)
+        self.identity = identity
+        self.exclude_paths = exclude_paths or ["/healthz", "/readyz"]
+
+        # Create mock claims that mimic OIDC token structure
+        self.mock_claims = {
+            'sub': identity,
+            'preferred_username': identity,
+            'name': identity,
+            'email': f'{identity}@test.local',
+            'iss': 'http://localhost/no-auth',
+            'aud': 'mcp-test',
+            'scope': 'openid profile email',
+        }
+
+    async def dispatch(self, request: Request, call_next):
+        """Inject mock claims into all requests."""
+        # Skip for health checks
+        for excluded in self.exclude_paths:
+            if request.url.path.startswith(excluded):
+                return await call_next(request)
+
+        # Inject mock claims into request state
+        request.state.auth_claims = self.mock_claims
+        request.state.user_id = self.identity
+        request.state.claims = self.mock_claims  # For user_hash.py
+
+        return await call_next(request)
+
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 
+def _install_clean_shutdown_handlers() -> None:
+    """
+    Install SIGTERM/SIGINT handlers that perform a normal sys.exit so atexit
+    hooks (notably coverage.py's data-save hook) get to run.
+
+    uvicorn captures these as the "original" handlers in its
+    `capture_signals()` context, overrides them while serving, and on
+    shutdown restores + re-raises the captured signal — at which point our
+    handler runs sys.exit(0), the process exits cleanly, and atexit fires.
+
+    Without this, uvicorn restores Python's default handler and the re-raised
+    signal terminates the process with exit 128+sig and skips atexit, which
+    causes `coverage run` to write no data file (and any other atexit-based
+    cleanup to be skipped).
+    """
+    import signal
+
+    def _exit(signum: int, _frame) -> None:
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _exit)
+    signal.signal(signal.SIGINT, _exit)
+
+
 def main():
     """Main entry point for the test server."""
+    _install_clean_shutdown_handlers()
+
     parser = argparse.ArgumentParser(
-        description="CloudNativePG MCP Test Server (OIDC Auth)"
+        description="cnpg-mcp MCP Test Server (OIDC Auth or No-Auth mode)"
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.getenv("PORT", "3001")),
-        help="Port to listen on (default: 3001)"
+        default=int(os.getenv("TEST_PORT", "4201")),
+        help="Port to listen on (default: 4201)"
     )
     parser.add_argument(
         "--host",
         default="0.0.0.0",
         help="Host to bind to (default: 0.0.0.0)"
     )
+    parser.add_argument(
+        "--no-auth",
+        action="store_true",
+        help="Disable authentication (for testing without credentials)"
+    )
+    parser.add_argument(
+        "--identity",
+        default="test-user",
+        help="Mock user identity when using --no-auth (default: test-user)"
+    )
 
     args = parser.parse_args()
 
+    # Determine auth mode
+    auth_mode = "No-Auth" if args.no_auth else "OIDC"
+
     logger.info("=" * 70)
-    logger.info("CloudNativePG MCP Test Server (OIDC Auth)")
+    logger.info(f"cnpg-mcp MCP Test Server ({auth_mode})")
     logger.info("=" * 70)
     logger.info(f"Listening on: {args.host}:{args.port}")
     logger.info(f"Endpoint: /test")
-    logger.info(f"Auth: Standard OIDC (Auth0 JWT tokens)")
-    logger.info("Tools: 12 CloudNativePG management tools")
+    if args.no_auth:
+        logger.info(f"Auth: DISABLED (no-auth mode)")
+        logger.info(f"Identity: {args.identity}")
+    else:
+        logger.info(f"Auth: Standard OIDC (Auth0 JWT tokens)")
     logger.info("=" * 70)
 
-    # Create OIDC auth provider
-    logger.info("🔐 Initializing OIDC authentication...")
-    oidc_provider = OIDCAuthProvider()
-    logger.info(f"   Issuer: {oidc_provider.issuer}")
-    logger.info(f"   Audience: {oidc_provider.audience}")
-
     # Create FastMCP HTTP app
-    app = mcp.http_app(transport="http", path="/test")
+    app = mcp.http_app(path="/test")
 
-    # Add OIDC middleware
-    logger.info("🔒 Adding OIDC authentication middleware...")
+    # Add CORS middleware to handle OPTIONS preflight requests
+    from starlette.middleware.cors import CORSMiddleware
     app.add_middleware(
-        OIDCAuthMiddleware,
-        auth_provider=oidc_provider,
-        exclude_paths=["/healthz", "/readyz"]
+        CORSMiddleware,
+        allow_origins=["*"],  # Allow all origins (customize as needed)
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],  # Explicitly allow OPTIONS
+        allow_headers=["*"],
     )
+
+    # Add request logging middleware with MCP message inspection
+    class RequestLoggingMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            # Log all non-health-check requests with MCP details
+            if request.url.path not in ["/healthz", "/readyz"]:
+                mcp_details = await self._extract_mcp_details(request)
+                logger.info(f"🌐 HTTP {request.method} {request.url.path}{mcp_details}")
+
+            response = await call_next(request)
+
+            # Log response status for non-health-checks
+            if request.url.path not in ["/healthz", "/readyz"]:
+                logger.info(f"   ← HTTP {response.status_code}")
+
+            return response
+
+        async def _extract_mcp_details(self, request: Request) -> str:
+            """Extract MCP method and tool/resource details from request."""
+            try:
+                # Read body without consuming it for downstream
+                body = await request.body()
+
+                # Parse JSON-RPC message
+                import json
+                message = json.loads(body)
+
+                method = message.get("method", "unknown")
+
+                # Extract details based on method type
+                if method == "tools/call":
+                    params = message.get("params", {})
+                    tool_name = params.get("name", "unknown")
+                    return f" → tools/call({tool_name})"
+                elif method == "resources/read":
+                    params = message.get("params", {})
+                    uri = params.get("uri", "unknown")
+                    return f" → resources/read({uri})"
+                elif method in ["tools/list", "resources/list", "prompts/list"]:
+                    return f" → {method}"
+                elif method == "initialize":
+                    return f" → initialize"
+                else:
+                    return f" → {method}"
+
+            except Exception:
+                # If we can't parse, just return empty string
+                return ""
+
+    logger.info("Adding request logging middleware...")
+    app.add_middleware(RequestLoggingMiddleware)
+
+    # Add authentication middleware based on mode
+    if args.no_auth:
+        logger.info(f"Adding NoAuth middleware (identity: {args.identity})...")
+        app.add_middleware(
+            NoAuthMiddleware,
+            identity=args.identity,
+            exclude_paths=["/healthz", "/readyz"]
+        )
+    else:
+        # Create OIDC auth provider
+        logger.info("Initializing OIDC authentication...")
+        oidc_provider = OIDCAuthProvider()
+        logger.info(f"   Issuer: {oidc_provider.issuer}")
+        logger.info(f"   Audience: {oidc_provider.audience}")
+
+        logger.info("Adding OIDC authentication middleware...")
+        app.add_middleware(
+            OIDCAuthMiddleware,
+            auth_provider=oidc_provider,
+            exclude_paths=["/healthz", "/readyz"]
+        )
 
     # Add health check routes
     app.add_route("/healthz", liveness_check)
@@ -321,19 +313,27 @@ def main():
 
     logger.info("✅ Test server ready")
     logger.info("")
-    logger.info("To test with Auth0 JWT token:")
-    logger.info("  1. Get token: ./test/get-user-token.py")
-    logger.info("  2. Test: ./test/test-mcp.py --transport http \\")
-    logger.info(f"           --url http://localhost:{args.port}/test \\")
-    logger.info("           --token-file /tmp/user-token.txt")
+    if args.no_auth:
+        logger.info("To test (no authentication required):")
+        logger.info(f"  ./test/test-mcp.py --url http://localhost:{args.port}/test --no-auth")
+    else:
+        logger.info("To test with Auth0 JWT token:")
+        logger.info("  1. Get token: ./test/get-user-token.py")
+        logger.info("  2. Test: ./test/test-mcp.py --transport http \\")
+        logger.info(f"           --url http://localhost:{args.port}/test \\")
+        logger.info("           --token-file /tmp/user-token.txt")
     logger.info("")
+
+    # Add health check filter to uvicorn access logger
+    logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
 
     # Run server
     uvicorn.run(
         app,
         host=args.host,
         port=args.port,
-        log_level="info"
+        log_level="info",
+        ws="none"
     )
 
 

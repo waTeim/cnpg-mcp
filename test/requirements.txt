@@ -1,0 +1,9 @@
+# Test-only dependencies (NOT installed into the production container).
+# Install with: pip install -r test/requirements.txt
+
+# Line/branch coverage for the test server.
+coverage[toml]>=7.0
+
+# Used by test/plugins/test_health_endpoints.py to hit /healthz and /readyz
+# (the MCP session handles JSON-RPC; httpx handles plain HTTP).
+httpx>=0.27.0

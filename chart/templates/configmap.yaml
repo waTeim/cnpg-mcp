@@ -6,75 +6,51 @@ metadata:
     {{- include "cnpg-mcp.labels" . | nindent 4 }}
 data:
   oidc.yaml: |
-    # FastMCP OAuth Proxy Configuration for Auth0
-    # Auto-generated from Helm values
-    #
-    # The MCP server uses FastMCP's built-in OAuth Proxy to handle token issuance:
-    # - Receives Auth0 tokens internally (may be JWE encrypted)
-    # - Issues MCP-signed JWT tokens to clients (NOT Auth0 tokens)
-    # - Manages session binding between Auth0 and MCP tokens
+    # Auto-generated from Helm values.
+    # See mcp-base docs/cli-integration-contract.md §6 for the authoritative schema.
+    auth_type: {{ .Values.oidc.authType | quote }}
 
-    # ========================================================================
-    # REQUIRED: Auth0 Configuration
-    # ========================================================================
-
-    # Auth0 domain (OIDC issuer URL)
-    issuer: {{ .Values.oidc.issuer | quote }}
-
-    # API identifier (expected audience claim in tokens)
+    {{- if eq .Values.oidc.authType "keycloak" }}
+    # ------------------------------------------------------------------
+    # Pattern B — FastMCP KeycloakAuthProvider
+    # Keycloak serves DCR natively; FastMCP only verifies JWTs against its JWKS.
+    # No client_secret, JWT signing key, or Redis required.
+    # ------------------------------------------------------------------
+    realm_url: {{ .Values.oidc.issuer | quote }}
     audience: {{ .Values.oidc.audience | quote }}
-
-    # Auth0 application client ID (pre-registered application)
+    required_scopes: {{ .Values.oidc.requiredScopes | default (list "openid") | toJson }}
+    {{- else }}
+    # ------------------------------------------------------------------
+    # Pattern A — FastMCP OAuth proxy (auth0 / generic oidc)
+    # FastMCP runs local DCR, issues MCP-signed tokens, persists sessions in Redis.
+    # ------------------------------------------------------------------
+    issuer: {{ .Values.oidc.issuer | quote }}
+    audience: {{ .Values.oidc.audience | quote }}
     client_id: {{ .Values.oidc.clientId | quote }}
 
-    # Path to server client secret file (mounted from Kubernetes Secret)
-    # Secret name: {{ .Release.Name }}-auth0-credentials
-    # Secret key: server-client-secret
-    # FastMCP Auth0Provider uses this to authenticate with Auth0 during token exchange
-    client_secret_file: "/etc/mcp/secrets/auth0/server-client-secret"
-
-    # Path to JWT signing key file (mounted from Kubernetes Secret)
-    # Secret name: {{ .Values.jwt.secretName | default (printf "%s-jwt-signing-key" .Release.Name) }}
-    # Secret key: jwt-signing-key
-    # Used to sign MCP tokens issued to clients (required for multi-replica deployments)
+    client_secret_file: '/etc/mcp/secrets/oidc/{{ .Values.oidc.clientSecretKey | default "server-client-secret" }}'
     jwt_signing_key_file: "/etc/mcp/secrets/jwt-signing-key"
-
-    # Path to storage encryption key file (mounted from Kubernetes Secret)
-    # Secret name: {{ .Values.jwt.secretName | default (printf "%s-jwt-signing-key" .Release.Name) }}
-    # Secret key: storage-encryption-key
-    # Used to encrypt OAuth tokens stored in Redis (required for multi-replica deployments)
     storage_encryption_key_file: "/etc/mcp/secrets/storage-encryption-key"
-
-    # ========================================================================
-    # REQUIRED: Server Configuration
-    # ========================================================================
-
-    {{- if and .Values.ingress.enabled .Values.ingress.host }}
-    # Public URL of this MCP server (derived from ingress configuration)
-    # Used for OAuth callbacks and metadata endpoints
-    public_url: {{ if .Values.ingress.tls.enabled }}"https://{{ .Values.ingress.host }}"{{ else }}"http://{{ .Values.ingress.host }}"{{ end }}
     {{- end }}
 
-    # ========================================================================
-    # OPTIONAL: Advanced Configuration
-    # ========================================================================
+    {{- if .Values.oidc.publicUrl }}
+    public_url: {{ .Values.oidc.publicUrl | quote }}
+    {{- else if and .Values.ingress.enabled .Values.ingress.host }}
+    public_url: {{ if .Values.ingress.tls.enabled }}"https://{{ .Values.ingress.host }}"{{ else }}"http://{{ .Values.ingress.host }}"{{ end }}
+    {{- else }}
+    # WARNING: No public_url configured — OAuth callbacks will fail.
+    {{- end }}
 
     {{- if .Values.oidc.jwksUri }}
-    # Override JWKS URI (auto-discovered from issuer by default)
     jwks_uri: {{ .Values.oidc.jwksUri | quote }}
     {{- end }}
 
-    {{- if .Values.oidc.scope }}
-    # Required OAuth2 scope (default: openid)
+    {{- if and (ne .Values.oidc.authType "keycloak") .Values.oidc.scope }}
     scope: {{ .Values.oidc.scope | quote }}
     {{- end }}
 
-    # ========================================================================
-    # Redis Configuration (OAuth Session Persistence)
-    # ========================================================================
-    {{- if .Values.redis.enabled }}
-    # Redis configuration for OAuth session persistence across restarts
-    # Without Redis, OAuth sessions are stored in-memory and lost on pod restart
+    {{- if and (ne .Values.oidc.authType "keycloak") .Values.redis.enabled }}
+    # Redis — Pattern A session persistence.
     redis:
       host: "{{ .Release.Name }}-redis"
       port: {{ .Values.redis.service.port | default 6379 }}
