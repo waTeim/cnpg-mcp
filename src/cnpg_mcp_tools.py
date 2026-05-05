@@ -95,6 +95,18 @@ CNPG_VERSION = "v1"
 CNPG_PLURAL = "clusters"
 CNPG_DATABASE_PLURAL = "databases"
 
+DATABASE_CREATE_OPTION_LABELS = {
+    "encoding": "Encoding",
+    "locale": "Locale",
+    "localeProvider": "Locale Provider",
+    "localeCollate": "LC_COLLATE",
+    "localeCType": "LC_CTYPE",
+    "icuLocale": "ICU Locale",
+    "icuRules": "ICU Rules",
+    "builtinLocale": "Builtin Locale",
+    "collationVersion": "Collation Version",
+}
+
 # Transport mode (set via CLI args)
 TRANSPORT_MODE = "stdio"  # or "http"
 
@@ -252,6 +264,18 @@ def truncate_response(content: str, max_length: int = CHARACTER_LIMIT) -> str:
     
     truncated = content[:max_length - 100]
     return f"{truncated}\n\n... (truncated, {len(content) - max_length} characters omitted)"
+
+
+def format_database_create_options(spec: Dict[str, Any]) -> str:
+    """Format optional Database CRD CREATE DATABASE parameters."""
+    lines = [
+        f"- {label}: {spec[field]}"
+        for field, label in DATABASE_CREATE_OPTION_LABELS.items()
+        if field in spec
+    ]
+    if not lines:
+        return "- Defaults: inherited from PostgreSQL/template settings"
+    return "\n".join(lines)
 
 
 def format_error_message(error: Exception, context: str = "") -> str:
@@ -618,6 +642,42 @@ class CreateDatabaseInput(BaseModel):
     reclaim_policy: Literal["retain", "delete"] = Field(
         "retain",
         description="Policy for database deletion. 'retain' keeps the database when the CRD is deleted, 'delete' removes it."
+    )
+    encoding: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE ENCODING value, for example UTF8. Immutable after creation."
+    )
+    locale: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE LOCALE value. Sets default collation order and character classification. Immutable after creation."
+    )
+    locale_provider: Optional[Literal["builtin", "icu", "libc"]] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE LOCALE_PROVIDER value. PostgreSQL 16+ supports this for databases."
+    )
+    locale_collate: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE LC_COLLATE value. Immutable after creation."
+    )
+    locale_ctype: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE LC_CTYPE value. Immutable after creation."
+    )
+    icu_locale: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE ICU_LOCALE value. Requires locale_provider='icu'."
+    )
+    icu_rules: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE ICU_RULES value. Requires locale_provider='icu'."
+    )
+    builtin_locale: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE BUILTIN_LOCALE value. Requires locale_provider='builtin'."
+    )
+    collation_version: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE COLLATION_VERSION value. Immutable after creation."
     )
     namespace: Optional[str] = Field(
         None,
@@ -1941,6 +2001,9 @@ async def list_postgres_databases(
                     "ensure": spec.get('ensure', 'present'),
                     "reclaim_policy": spec.get('databaseReclaimPolicy', 'retain')
                 }
+                for field in DATABASE_CREATE_OPTION_LABELS:
+                    if field in spec:
+                        db_data[field] = spec[field]
                 database_list.append(db_data)
 
             return json.dumps({
@@ -1966,6 +2029,9 @@ async def list_postgres_databases(
             result += f"  - Owner: {owner}\n"
             result += f"  - Ensure: {ensure}\n"
             result += f"  - Reclaim Policy: {reclaim_policy}\n"
+            for field, label in DATABASE_CREATE_OPTION_LABELS.items():
+                if field in spec:
+                    result += f"  - {label}: {spec[field]}\n"
             result += "\n"
 
         return result
@@ -1982,6 +2048,15 @@ async def create_postgres_database(
     database_name: str,
     owner: str,
     reclaim_policy: Literal["retain", "delete"] = "retain",
+    encoding: Optional[str] = None,
+    locale: Optional[str] = None,
+    locale_provider: Optional[Literal["builtin", "icu", "libc"]] = None,
+    locale_collate: Optional[str] = None,
+    locale_ctype: Optional[str] = None,
+    icu_locale: Optional[str] = None,
+    icu_rules: Optional[str] = None,
+    builtin_locale: Optional[str] = None,
+    collation_version: Optional[str] = None,
     namespace: Optional[str] = None,
     dry_run: bool = False
 ) -> str:
@@ -1995,6 +2070,15 @@ async def create_postgres_database(
         database_name: Name of the database to create.
         owner: Name of the role that will own the database.
         reclaim_policy: 'retain' to keep database after CRD deletion, 'delete' to remove it.
+        encoding: Optional CREATE DATABASE ENCODING value, for example UTF8.
+        locale: Optional CREATE DATABASE LOCALE value.
+        locale_provider: Optional CREATE DATABASE LOCALE_PROVIDER value: builtin, icu, or libc.
+        locale_collate: Optional CREATE DATABASE LC_COLLATE value.
+        locale_ctype: Optional CREATE DATABASE LC_CTYPE value.
+        icu_locale: Optional CREATE DATABASE ICU_LOCALE value. Requires locale_provider='icu'.
+        icu_rules: Optional CREATE DATABASE ICU_RULES value. Requires locale_provider='icu'.
+        builtin_locale: Optional CREATE DATABASE BUILTIN_LOCALE value. Requires locale_provider='builtin'.
+        collation_version: Optional CREATE DATABASE COLLATION_VERSION value.
         namespace: Kubernetes namespace.
         dry_run: If True, shows the Database CRD definition that would be created without
                 creating it. Useful for previewing the configuration. Default is False.
@@ -2015,6 +2099,12 @@ async def create_postgres_database(
 
         # Validate the resulting CRD name also conforms to RFC 1123
         validate_rfc1123_name(crd_name, "Database CRD")
+
+        if (icu_locale or icu_rules) and locale_provider != "icu":
+            return "Error: icu_locale and icu_rules require locale_provider='icu'."
+
+        if builtin_locale and locale_provider != "builtin":
+            return "Error: builtin_locale requires locale_provider='builtin'."
 
         # Build the Database CRD
         database_crd = {
@@ -2039,6 +2129,23 @@ async def create_postgres_database(
             }
         }
 
+        optional_database_fields = {
+            "encoding": encoding,
+            "locale": locale,
+            "localeProvider": locale_provider,
+            "localeCollate": locale_collate,
+            "localeCType": locale_ctype,
+            "icuLocale": icu_locale,
+            "icuRules": icu_rules,
+            "builtinLocale": builtin_locale,
+            "collationVersion": collation_version,
+        }
+        for field, value in optional_database_fields.items():
+            if value is not None:
+                database_crd["spec"][field] = value
+
+        database_options = format_database_create_options(database_crd["spec"])
+
         # If dry_run, return the Database CRD definition
         if dry_run:
             database_yaml = yaml.dump(database_crd, default_flow_style=False, sort_keys=False)
@@ -2054,6 +2161,9 @@ Database Details:
 - Owner: {owner}
 - Reclaim Policy: {reclaim_policy}
 - CRD Name: {crd_name}
+
+Database Locale/Encoding Options:
+{database_options}
 
 Reclaim Policy Behavior:
 - retain: Database will be kept in PostgreSQL even if the CRD is deleted
@@ -2080,6 +2190,9 @@ Database Details:
 - Owner: {owner}
 - Reclaim Policy: {reclaim_policy}
 - CRD Name: {crd_name}
+
+Database Locale/Encoding Options:
+{database_options}
 
 The CloudNativePG operator will create this database in the cluster.
 
@@ -2513,7 +2626,16 @@ def register_tools(mcp):
         database_name: str,
         owner: str,
         reclaim_policy: Literal["retain", "delete"] = "retain",
-        namespace: str = None,
+        encoding: Optional[str] = None,
+        locale: Optional[str] = None,
+        locale_provider: Optional[Literal["builtin", "icu", "libc"]] = None,
+        locale_collate: Optional[str] = None,
+        locale_ctype: Optional[str] = None,
+        icu_locale: Optional[str] = None,
+        icu_rules: Optional[str] = None,
+        builtin_locale: Optional[str] = None,
+        collation_version: Optional[str] = None,
+        namespace: Optional[str] = None,
         dry_run: bool = False,
         ctx: Context = None,
     ) -> str:
@@ -2524,6 +2646,15 @@ def register_tools(mcp):
             database_name=database_name,
             owner=owner,
             reclaim_policy=reclaim_policy,
+            encoding=encoding,
+            locale=locale,
+            locale_provider=locale_provider,
+            locale_collate=locale_collate,
+            locale_ctype=locale_ctype,
+            icu_locale=icu_locale,
+            icu_rules=icu_rules,
+            builtin_locale=builtin_locale,
+            collation_version=collation_version,
             namespace=namespace,
             dry_run=dry_run,
         )

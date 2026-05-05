@@ -24,6 +24,11 @@ The server exposes the CloudNativePG tools from the v1 implementation:
 - `create_postgres_database`
 - `delete_postgres_database`
 
+`create_postgres_database` supports CloudNativePG Database CRD create-time
+locale options, including `encoding`, `locale`, `locale_provider`,
+`locale_collate`, `locale_ctype`, `icu_locale`, `icu_rules`,
+`builtin_locale`, and `collation_version`.
+
 It also includes MCP Base scaffold admin tools for prompt management:
 
 - `admin_reload_prompts`
