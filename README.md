@@ -105,6 +105,29 @@ order:
 Most tools accept an optional `namespace`. When omitted, the current Kubernetes
 context namespace is used, falling back to `default`.
 
+For in-cluster Helm deployments, the server uses the deployment service account.
+By default the chart grants that service account CNPG and secret permissions
+only in the Helm release namespace. To manage CNPG resources in another
+namespace, pass the tool's `namespace` argument and grant the service account
+access there:
+
+```yaml
+rbac:
+  targetNamespaces:
+    - application-databases
+```
+
+For a shared MCP deployment that must operate in arbitrary namespaces, opt in to
+cluster-wide RBAC:
+
+```yaml
+rbac:
+  clusterWide: true
+```
+
+Cluster-wide mode grants secret access across namespaces, so prefer explicit
+`targetNamespaces` when the target set is known.
+
 ## Deployment
 
 The MCP Base scaffold includes Docker and Helm assets:

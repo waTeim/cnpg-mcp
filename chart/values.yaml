@@ -186,9 +186,21 @@ oidc:
 
 # Operator RBAC Configuration
 # The chart creates namespaced permissions for CloudNativePG clusters,
-# Database CRDs, and role/database secrets. Add ClusterRole names here only
-# when your operator installation provides extra roles you also want bound.
+# Database CRDs, and role/database secrets in the release namespace by default.
 rbac:
+  # Additional namespaces where the MCP deployment service account can manage
+  # CloudNativePG resources. The service account remains in the release
+  # namespace, but receives a RoleBinding in each target namespace.
+  targetNamespaces: []
+
+  # Grant the MCP deployment service account access in every namespace. This is
+  # convenient for shared control-plane deployments, but broad because it grants
+  # secret permissions cluster-wide.
+  clusterWide: false
+
+  # Add ClusterRole names here only when your operator installation provides
+  # extra roles you also want bound. These are bound in each target namespace,
+  # or cluster-wide when rbac.clusterWide is true.
   operatorClusterRoles: []
 
 # Prompt Management Configuration
