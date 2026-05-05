@@ -1,11 +1,11 @@
-# CloudNativePG MCP Server - Production Dockerfile
+# cnpg-mcp MCP Server - Production Dockerfile
 # Optimized for Kubernetes deployment with in-cluster authentication and OIDC support
 
 FROM python:3.11-slim
 
 # Metadata
-LABEL maintainer="CloudNativePG MCP Server"
-LABEL description="MCP Server for managing PostgreSQL clusters via CloudNativePG"
+LABEL maintainer="cnpg-mcp MCP Server"
+LABEL description=""
 LABEL version="1.0.0"
 
 # Set environment variables
@@ -29,13 +29,20 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy canonical project config so server + healthcheck can read ports/etc.
+COPY mcp-project.yaml ./mcp-project.yaml
+
+# Copy production application code. NOTE: the test server entrypoint
+# (cnpg_mcp_test_server.py) is intentionally NOT copied here
+# — it ships only in the test image (test/Dockerfile, FROM this image)
+# so production containers have no test-only attack surface.
 COPY src/cnpg_mcp_server.py .
-COPY src/cnpg_mcp_test_server.py .
-COPY src/cnpg_tools.py .
+COPY src/cnpg_mcp_tools.py .
+COPY src/mcp_context.py .
 COPY src/user_hash.py .
 COPY src/auth_oidc.py .
 COPY src/auth_fastmcp.py .
+COPY src/prompt_registry.py .
 
 # Create a non-root user for security
 RUN useradd -m -u 1000 mcpuser && \
@@ -44,14 +51,14 @@ RUN useradd -m -u 1000 mcpuser && \
 USER mcpuser
 
 # Expose HTTP port
-EXPOSE 4204
+EXPOSE 4200
 
 # Health check endpoint
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:4204/healthz || exit 1
+    CMD curl -f http://localhost:4200/healthz || exit 1
 
 # Default to HTTP transport (for Kubernetes deployment)
 # The server will use in-cluster config automatically when running in a pod
 # OIDC configuration should be provided via environment variables:
-#   OIDC_ISSUER, OIDC_AUDIENCE, OIDC_JWKS_URI (optional), DCR_PROXY_URL (optional)
-CMD ["python", "cnpg_mcp_server.py", "--transport", "http", "--host", "0.0.0.0", "--port", "4204"]
+#   OIDC_ISSUER, OIDC_AUDIENCE, AUTH0_CLIENT_ID, PUBLIC_URL
+CMD ["python", "cnpg_mcp_server.py", "--host", "0.0.0.0", "--port", "4200"]

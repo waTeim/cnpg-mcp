@@ -1,0 +1,221 @@
+# Default values for cnpg-mcp.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+
+image:
+  repository: your-registry.example.com/cnpg-mcp
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: "cnpg-mcp"
+
+podAnnotations: {}
+
+podSecurityContext: {}
+  # fsGroup: 2000
+
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #   - ALL
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+service:
+  type: ClusterIP
+  port: 4204
+  # Test sidecar port (only used when testSidecar.enabled = true)
+  testPort: 3001
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+  # Single hostname for this MCP server (simplified from array)
+  host: "chart-example.local"
+  # Path for the MCP endpoint (usually /)
+  path: /
+  pathType: ImplementationSpecific
+  # TLS configuration
+  tls:
+    enabled: false
+    secretName: ""
+    # secretName: chart-example-tls
+
+resources: {}
+  # We usually recommend not to specify default resources and to leave this as a conscious
+  # choice for the user. This also increases chances charts run on environments with little
+  # resources, such as Minikube. If you do want to specify resources, uncomment the following
+  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
+  # limits:
+  #   cpu: 100m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# JWT Signing Key Secret
+# REQUIRED for production deployments (especially multi-replica)
+# Create using: python bin/create_jwt_secret.py --release-name <release-name>
+jwt:
+  # Name of the Kubernetes secret containing the JWT signing key
+  # Secret should have key: jwt-signing-key
+  # Default: {{ .Release.Name }}-jwt-signing-key
+  secretName: ""  # Leave empty to use default
+
+# OIDC/OAuth2 Authentication Configuration
+# REQUIRED for production HTTP mode deployment
+oidc:
+  # REQUIRED: OIDC Issuer URL (base URL of your identity provider)
+  # Examples:
+  #   Auth0: https://your-tenant.auth0.com
+  #   Keycloak: https://keycloak.example.com/realms/your-realm
+  #   Okta: https://your-org.okta.com/oauth2/default
+  #   Azure AD: https://login.microsoftonline.com/{tenant-id}/v2.0
+  issuer: "https://dev-15i-ae3b.auth0.com"
+
+  # REQUIRED: Expected audience claim in JWT tokens
+  # This should match what your IdP issues in the 'aud' claim
+  audience: "https://cnpg-mcp.wat.im/mcp"
+
+  # OPTIONAL: Override JWKS URI (auto-discovered from issuer by default)
+  # Only set if your IdP doesn't support OIDC discovery
+  # jwksUri: ""
+
+  # OPTIONAL: DCR (Dynamic Client Registration) proxy URL
+  # Use if your IdP doesn't support RFC 7591 DCR natively
+  # dcrProxyUrl: ""
+
+  # OPTIONAL: Required OAuth2 scope (default: openid)
+  # scope: "openid"
+
+  # NOTE: Auth0 credentials secret is automatically derived from release name
+  # Secret name will be: {{ .Release.Name }}-auth0-credentials
+  #
+  # Create the secret using:
+  #   python bin/create_secrets.py --namespace <namespace> --release-name <release-name>
+  #
+  # The secret must contain:
+  #   - server-client-id: Server client ID (for FastMCP)
+  #   - server-client-secret: Server client secret (for FastMCP)
+  #   - mgmt-client-id: Management API client ID (for scripts)
+  #   - mgmt-client-secret: Management API client secret (for scripts)
+  #   - auth0-domain: Auth0 domain
+  #   - connection-id: Auth0 connection ID
+
+# Test Sidecar Configuration
+# Enables a second container for testing using standard OIDC authentication
+testSidecar:
+  # Enable test sidecar container
+  enabled: false
+
+  # Image for test sidecar (defaults to main image)
+  image:
+    repository: ""  # Leave empty to use main image
+    tag: ""         # Leave empty to use main image tag
+    pullPolicy: ""  # Leave empty to use main image pullPolicy
+
+  # Resource limits for test sidecar
+  resources: {}
+    # limits:
+    #   cpu: 200m
+    #   memory: 256Mi
+    # requests:
+    #   cpu: 100m
+    #   memory: 128Mi
+
+# Redis Configuration
+# Used for OAuth session persistence across restarts
+redis:
+  # Enable Redis deployment
+  enabled: true
+
+  # Redis architecture (standalone, replication, or cluster)
+  architecture: standalone
+
+  # Number of replicas (only for replication/cluster modes)
+  replicaCount: 1
+
+  # Redis server configuration (pass-through to redis.conf)
+  master:
+    configuration: |
+      maxmemory 256mb
+      maxmemory-policy allkeys-lru
+
+  # Redis resources
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  # Persistence configuration
+  persistence:
+    enabled: true
+    storageClass: ""  # Use default storage class
+    accessMode: ReadWriteOnce
+    size: 1Gi
+
+  # Pod security context
+  podSecurityContext:
+    fsGroup: 999
+    runAsUser: 999
+    runAsGroup: 999
+    runAsNonRoot: true
+
+  # Container security context
+  containerSecurityContext:
+    runAsUser: 999
+    runAsGroup: 999
+    runAsNonRoot: true
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
+
+  # Service configuration
+  service:
+    type: ClusterIP
+    port: 6379
+
+  # Authentication
+  auth:
+    enabled: false
+    # For internal session storage, authentication is not required
+    # If enabled, password will be stored in secret: {{ .Release.Name }}-redis
+    password: ""

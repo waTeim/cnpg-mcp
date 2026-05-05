@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Get a user access token from Auth0 using Authorization Code Flow with PKCE.
+Get a user access token from an OIDC provider using Authorization Code Flow with PKCE.
 
 This mimics how Claude Desktop and other MCP clients authenticate users.
 """
@@ -25,7 +25,7 @@ auth_error = None
 
 
 class CallbackHandler(BaseHTTPRequestHandler):
-    """Handle OAuth callback from Auth0."""
+    """Handle OAuth callback from an OIDC provider."""
 
     def log_message(self, format, *args):
         """Suppress default logging."""
@@ -115,20 +115,65 @@ def generate_pkce_pair():
     return code_verifier, code_challenge
 
 
-def load_auth0_config(config_path: str = "auth0-config.json") -> dict:
-    """Load Auth0 configuration."""
+def load_oidc_config(config_path: str = "oidc-config.json") -> dict:
+    """Load OIDC configuration."""
     config_file = Path(config_path)
+    if not config_file.exists() and config_path == "oidc-config.json":
+        legacy = Path("auth0-config.json")
+        if legacy.exists():
+            config_file = legacy
+
     if not config_file.exists():
         raise FileNotFoundError(
-            f"{config_path} not found. Run bin/setup-auth0.py first."
+            f"{config_path} not found. Create oidc-config.json or supply Auth0 config via auth0-config.json."
         )
 
     with open(config_file, 'r') as f:
         return json.load(f)
 
 
+def resolve_oidc_endpoints(config: dict) -> tuple[str, str, str]:
+    """
+    Resolve authorization and token endpoints for an OIDC provider.
+
+    Priority:
+    1. authorization_endpoint / token_endpoint in config
+    2. OIDC discovery via issuer
+    3. Issuer-derived Auth0-style endpoints (fallback)
+    """
+    issuer = config.get("issuer")
+    domain = config.get("domain")
+
+    if not issuer and domain:
+        issuer = domain if domain.startswith("http") else f"https://{domain}"
+
+    auth_endpoint = config.get("authorization_endpoint")
+    token_endpoint = config.get("token_endpoint")
+
+    if issuer and (not auth_endpoint or not token_endpoint):
+        discovery_url = f"{issuer.rstrip('/')}/.well-known/openid-configuration"
+        try:
+            response = requests.get(discovery_url, timeout=10)
+            if response.status_code == 200:
+                discovery = response.json()
+                auth_endpoint = auth_endpoint or discovery.get("authorization_endpoint")
+                token_endpoint = token_endpoint or discovery.get("token_endpoint")
+        except requests.RequestException:
+            pass
+
+    if issuer:
+        auth_endpoint = auth_endpoint or f"{issuer.rstrip('/')}/authorize"
+        token_endpoint = token_endpoint or f"{issuer.rstrip('/')}/oauth/token"
+
+    if not auth_endpoint or not token_endpoint:
+        raise ValueError("Could not resolve OIDC authorization/token endpoints.")
+
+    return issuer or "", auth_endpoint, token_endpoint
+
+
 def get_user_token_pkce(
-    domain: str,
+    authorization_endpoint: str,
+    token_endpoint: str,
     client_id: str,
     audience: str,
     callback_port: int = 8888,
@@ -140,8 +185,9 @@ def get_user_token_pkce(
     This is how Claude Desktop authenticates users.
 
     Args:
-        domain: Auth0 domain (e.g., dev-xxx.auth0.com)
-        client_id: Auth0 client ID
+        authorization_endpoint: OIDC authorization endpoint URL
+        token_endpoint: OIDC token endpoint URL
+        client_id: OIDC client ID
         audience: API audience
         callback_port: Local port for callback (default: 8888)
         scope: OAuth scopes to request
@@ -172,7 +218,7 @@ def get_user_token_pkce(
         'code_challenge_method': 'S256',
     }
 
-    authorization_url = f"https://{domain}/authorize?{urlencode(auth_params)}"
+    authorization_url = f"{authorization_endpoint}?{urlencode(auth_params)}"
 
     print("=" * 70)
     print("🔐 USER AUTHENTICATION (Authorization Code Flow with PKCE)")
@@ -181,7 +227,7 @@ def get_user_token_pkce(
     print("This is the same flow Claude Desktop uses for authentication.")
     print()
     print(f"1. Starting local callback server on http://localhost:{callback_port}")
-    print("2. Opening browser for Auth0 login...")
+    print("2. Opening browser for OIDC login...")
     print()
 
     # Start local HTTP server for callback
@@ -208,7 +254,7 @@ def get_user_token_pkce(
 
     print()
     print("⏳ Waiting for authentication in browser...")
-    print("   (Login with your Auth0 user credentials)")
+    print("   (Login with your IdP user credentials)")
     print()
 
     # Wait for callback
@@ -230,8 +276,6 @@ def get_user_token_pkce(
     print()
 
     # Exchange authorization code for access token
-    token_url = f"https://{domain}/oauth/token"
-
     token_data = {
         'grant_type': 'authorization_code',
         'client_id': client_id,
@@ -242,7 +286,7 @@ def get_user_token_pkce(
 
     try:
         response = requests.post(
-            token_url,
+            token_endpoint,
             headers={'Content-Type': 'application/x-www-form-urlencoded'},
             data=token_data,
             timeout=10
@@ -314,46 +358,51 @@ def get_user_token_pkce(
 def main():
     print()
     print("=" * 70)
-    print("Auth0 User Token Generator")
+    print("OIDC User Token Generator")
     print("Authorization Code Flow with PKCE (Claude Desktop compatible)")
     print("=" * 70)
     print()
 
     # Load config
     try:
-        config = load_auth0_config()
+        config = load_oidc_config()
     except FileNotFoundError as e:
         print(f"❌ Error: {e}")
         print()
-        print("Run this first:")
+        print("If you're using Auth0, you can run:")
         print("  python bin/setup-auth0.py --token YOUR_AUTH0_MGMT_TOKEN")
         return 1
 
-    domain = config.get("domain")
     audience = config.get("audience")
 
     # Check for test_client (SPA/Native client for test harness)
     test_client_config = config.get("test_client", {})
-    client_id = test_client_config.get("client_id")
+    client_id = test_client_config.get("client_id") or config.get("client_id") or config.get("clientId")
 
-    if not all([domain, client_id, audience]):
-        print("❌ Incomplete Auth0 configuration")
-        print(f"   Domain: {domain}")
+    try:
+        issuer, authorization_endpoint, token_endpoint = resolve_oidc_endpoints(config)
+    except ValueError as e:
+        print(f"❌ {e}")
+        return 1
+
+    if not all([client_id, audience]):
+        print("❌ Incomplete OIDC configuration")
+        print(f"   Issuer: {issuer}")
         print(f"   Client ID: {client_id}")
         print(f"   Audience: {audience}")
         print()
-        print("Run setup-auth0.py to create a user authentication client:")
-        print("  python bin/setup-auth0.py --token YOUR_TOKEN --recreate-client")
+        print("Ensure your OIDC client and audience are configured.")
         return 1
 
-    print(f"Domain: {domain}")
+    print(f"Issuer: {issuer}")
     print(f"Audience: {audience}")
     print(f"Client ID: {client_id[:20]}...")
     print()
 
     # Get token
     token = get_user_token_pkce(
-        domain=domain,
+        authorization_endpoint=authorization_endpoint,
+        token_endpoint=token_endpoint,
         client_id=client_id,
         audience=audience,
         callback_port=8888,
@@ -365,13 +414,13 @@ def main():
         print("🎉 You can now test with MCP Inspector:")
         print()
         print("  ./test-inspector.py --transport http \\")
-        print("    --url https://cnpg-mcp.wat.im \\")
+        print("    --url https://your-mcp.example.com \\")
         print("    --token-file /tmp/user-token.txt")
         print()
         print("Or use curl:")
         print()
         print("  curl -H 'Authorization: Bearer $(cat /tmp/user-token.txt)' \\")
-        print("    https://cnpg-mcp.wat.im/mcp")
+        print("    https://your-mcp.example.com/mcp")
         print()
         return 0
     else:
@@ -384,8 +433,7 @@ def main():
         print("  - User not allowed for this application (connection not enabled)")
         print("  - User cancelled authentication")
         print()
-        print("To fix, re-run setup with --recreate-client:")
-        print("  python bin/setup-auth0.py --token YOUR_TOKEN --recreate-client")
+        print("To fix, re-run your IdP setup for the test client.")
         print()
         return 1
 

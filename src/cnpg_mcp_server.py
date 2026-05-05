@@ -1,20 +1,11 @@
 #!/usr/bin/env python3
 """
-CloudNativePG MCP Server (FastMCP OAuth)
+cnpg-mcp MCP Server - Entry Point
 
-Main MCP server for CloudNativePG management using FastMCP's OAuth proxy.
-This server issues MCP tokens after Auth0 authentication.
+MCP server using FastMCP with oidc authentication.
+HTTP transport only (Streamable HTTP).
 
-This runs as the primary container in a sidecar deployment alongside the
-test server:
-- Main server (port 3000): FastMCP OAuth proxy issuing MCP tokens
-- Test server (port 3001): Standard OIDC accepting Auth0 JWT tokens
-
-Both servers share the same 12 tool implementations from cnpg_tools.py.
-
-Transport Modes:
-- stdio: Communication over stdin/stdout (default, for Claude Desktop)
-- http: HTTP server with OAuth for remote access
+Tool implementations are in cnpg_mcp_tools.py
 """
 
 import argparse
@@ -32,21 +23,17 @@ import uvicorn
 from starlette.routing import Route
 from starlette.responses import JSONResponse
 
-# Import shared tools
-from cnpg_tools import (
-    list_postgres_clusters,
-    get_cluster_status,
-    create_postgres_cluster,
-    scale_postgres_cluster,
-    delete_postgres_cluster,
-    list_postgres_roles,
-    create_postgres_role,
-    update_postgres_role,
-    delete_postgres_role,
-    list_postgres_databases,
-    create_postgres_database,
-    delete_postgres_database,
-)
+# Import tool and resource registration from tools module
+from cnpg_mcp_tools import register_tools, register_resources
+
+# Build-time default — used only when neither the mounted oidc.yaml nor the
+# OIDC_AUTH_TYPE env var supplies a value. The actual auth_type used at
+# runtime is resolved by _resolve_auth_type() below so the helm chart's
+# `oidc.authType` (which renders into the mounted ConfigMap) controls which
+# branch runs, and a build-time/runtime mismatch surfaces as a warning
+# instead of a silent wrong-branch dispatch.
+_AUTH_TYPE_BUILD_DEFAULT = "oidc"
+_VALID_AUTH_TYPES = ("auth0", "keycloak", "oidc")
 
 # Configure logging
 logging.basicConfig(
@@ -56,189 +43,96 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Set log levels for external libraries
+
+def _resolve_auth_type() -> str:
+    """Pick the auth_type that drives transport dispatch.
+
+    Resolution order (highest priority first):
+      1. `auth_type` field in the mounted oidc.yaml ConfigMap
+      2. `OIDC_AUTH_TYPE` environment variable
+      3. The build-time default baked in by the scaffold generator
+
+    Logs the chosen value and its source. Logs a WARNING when the runtime
+    value differs from the build-time default, since that historically
+    caused silent wrong-branch dispatch (e.g. helm chart deploys
+    `authType: keycloak` but the entry point was generated with
+    `auth_type: oidc` and runs the wrong transport).
+    """
+    # Late import — auth_oidc / auth_fastmcp both expose this helper, and
+    # they're only safe to import once their dependencies are installed.
+    try:
+        from auth_oidc import load_oidc_config_from_file
+    except ImportError:
+        try:
+            from auth_fastmcp import load_oidc_config_from_file
+        except ImportError:
+            load_oidc_config_from_file = None  # type: ignore[assignment]
+
+    config_value = None
+    if load_oidc_config_from_file is not None:
+        try:
+            config = load_oidc_config_from_file() or {}
+            config_value = config.get("auth_type")
+        except Exception as e:
+            logger.warning(f"Could not load oidc.yaml to read auth_type: {e}")
+
+    env_value = os.getenv("OIDC_AUTH_TYPE")
+
+    if config_value:
+        chosen, source = config_value, "oidc.yaml"
+    elif env_value:
+        chosen, source = env_value, "OIDC_AUTH_TYPE env"
+    else:
+        chosen, source = _AUTH_TYPE_BUILD_DEFAULT, "build-time default"
+
+    if chosen not in _VALID_AUTH_TYPES:
+        raise ValueError(
+            f"Invalid auth_type {chosen!r} from {source}. "
+            f"Expected one of {_VALID_AUTH_TYPES}."
+        )
+
+    logger.info(f"🔐 auth_type = {chosen!r} (source: {source})")
+    if chosen != _AUTH_TYPE_BUILD_DEFAULT:
+        logger.warning(
+            f"⚠️  Runtime auth_type {chosen!r} differs from build-time "
+            f"default {_AUTH_TYPE_BUILD_DEFAULT!r}. The runtime value wins, "
+            f"but if you also customized cnpg_mcp_tools.py or "
+            f"chart templates for {_AUTH_TYPE_BUILD_DEFAULT!r}, regenerate "
+            f"the scaffold with --auth-type {chosen} to keep them aligned."
+        )
+    return chosen
+
+# Suppress noisy loggers
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+# Custom filter to exclude health check endpoints from access logs
+class HealthCheckFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Exclude health check paths from access logs
+        return not any(path in record.getMessage() for path in ["/healthz", "/readyz", "/health"])
 
 # ============================================================================
 # FastMCP Server Initialization
 # ============================================================================
 
-mcp = FastMCP("cloudnative-pg")
+mcp = FastMCP(
+    "cnpg-mcp",
+    instructions="""
+cnpg-mcp MCP Server.
+
+This server provides tools for managing CloudNativePG clusters, roles,
+and databases in Kubernetes environments.
+"""
+)
 
 # ============================================================================
-# Register Tools
+# Register Resources and Tools from tools module
 # ============================================================================
 
-# Register all 12 tools by decorating the imported functions
-# These are the same tool implementations used by the test server
+register_resources(mcp)
+register_tools(mcp)
 
-@mcp.tool(name="list_postgres_clusters")
-async def list_postgres_clusters_tool(namespace: str = None,
-    detail_level: str = "concise",
-    format: str = "text",
-    ctx: Context = None
-):
-    """List all PostgreSQL clusters managed by CloudNativePG."""
-    return await list_postgres_clusters(ctx, namespace=namespace, detail_level=detail_level, format=format)
-
-
-@mcp.tool(name="get_cluster_status")
-async def get_cluster_status_tool(name: str,
-    namespace: str = None,
-    detail_level: str = "concise",
-    format: str = "text",
-    ctx: Context = None
-):
-    """Get detailed status of a specific PostgreSQL cluster."""
-    return await get_cluster_status(ctx, name=name, namespace=namespace, detail_level=detail_level, format=format)
-
-
-@mcp.tool(name="create_postgres_cluster")
-async def create_postgres_cluster_tool(name: str,
-    instances: int = 3,
-    storage_size: str = "10Gi",
-    postgres_version: str = "16",
-    storage_class: str = None,
-    wait: bool = False,
-    timeout: int = None,
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Create a new PostgreSQL cluster with high availability configuration."""
-    return await create_postgres_cluster(
-        ctx, name=name, instances=instances, storage_size=storage_size,
-        postgres_version=postgres_version, storage_class=storage_class,
-        wait=wait, timeout=timeout, namespace=namespace, dry_run=dry_run
-    )
-
-
-@mcp.tool(name="scale_postgres_cluster")
-async def scale_postgres_cluster_tool(name: str,
-    instances: int,
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Scale a PostgreSQL cluster by changing the number of instances."""
-    return await scale_postgres_cluster(ctx, name=name, instances=instances, namespace=namespace, dry_run=dry_run)
-
-
-@mcp.tool(name="delete_postgres_cluster")
-async def delete_postgres_cluster_tool(name: str,
-    confirm_deletion: bool = False,
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Delete a PostgreSQL cluster."""
-    return await delete_postgres_cluster(ctx, name=name, confirm_deletion=confirm_deletion, namespace=namespace, dry_run=dry_run)
-
-
-@mcp.tool(name="list_postgres_roles")
-async def list_postgres_roles_tool(cluster_name: str,
-    namespace: str = None,
-    format: str = "text",
-    ctx: Context = None
-):
-    """List all PostgreSQL roles (users) in a cluster."""
-    return await list_postgres_roles(ctx, cluster_name=cluster_name, namespace=namespace, format=format)
-
-
-@mcp.tool(name="create_postgres_role")
-async def create_postgres_role_tool(cluster_name: str,
-    role_name: str,
-    login: bool = True,
-    superuser: bool = False,
-    inherit: bool = True,
-    createdb: bool = False,
-    createrole: bool = False,
-    replication: bool = False,
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Create a new PostgreSQL role (user) with auto-generated password."""
-    return await create_postgres_role(
-        ctx, cluster_name=cluster_name, role_name=role_name, login=login,
-        superuser=superuser, inherit=inherit, createdb=createdb,
-        createrole=createrole, replication=replication, namespace=namespace, dry_run=dry_run
-    )
-
-
-@mcp.tool(name="update_postgres_role")
-async def update_postgres_role_tool(cluster_name: str,
-    role_name: str,
-    login: bool = None,
-    superuser: bool = None,
-    inherit: bool = None,
-    createdb: bool = None,
-    createrole: bool = None,
-    replication: bool = None,
-    password: str = None,
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Update an existing PostgreSQL role's attributes and optionally reset password."""
-    return await update_postgres_role(
-        ctx, cluster_name=cluster_name, role_name=role_name, login=login,
-        superuser=superuser, inherit=inherit, createdb=createdb,
-        createrole=createrole, replication=replication, password=password,
-        namespace=namespace, dry_run=dry_run
-    )
-
-
-@mcp.tool(name="delete_postgres_role")
-async def delete_postgres_role_tool(cluster_name: str,
-    role_name: str,
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Delete a PostgreSQL role and its associated secret."""
-    return await delete_postgres_role(ctx, cluster_name=cluster_name, role_name=role_name, namespace=namespace, dry_run=dry_run)
-
-
-@mcp.tool(name="list_postgres_databases")
-async def list_postgres_databases_tool(cluster_name: str,
-    namespace: str = None,
-    format: str = "text",
-    ctx: Context = None
-):
-    """List all databases managed by Database CRDs."""
-    return await list_postgres_databases(ctx, cluster_name=cluster_name, namespace=namespace, format=format)
-
-
-@mcp.tool(name="create_postgres_database")
-async def create_postgres_database_tool(cluster_name: str,
-    database_name: str,
-    owner: str,
-    reclaim_policy: str = "retain",
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Create a new database using Database CRD."""
-    return await create_postgres_database(
-        ctx, cluster_name=cluster_name, database_name=database_name, owner=owner,
-        reclaim_policy=reclaim_policy, namespace=namespace, dry_run=dry_run
-    )
-
-
-@mcp.tool(name="delete_postgres_database")
-async def delete_postgres_database_tool(cluster_name: str,
-    database_name: str,
-    namespace: str = None,
-    dry_run: bool = False,
-    ctx: Context = None
-):
-    """Delete a Database CRD (actual deletion depends on reclaim policy)."""
-    return await delete_postgres_database(ctx, cluster_name=cluster_name, database_name=database_name, namespace=namespace, dry_run=dry_run)
-
-
-logger.info("Registered 12 tools with main MCP server")
+logger.info("Resources and tools registered with MCP server")
 
 # ============================================================================
 # Health Check Endpoints
@@ -255,26 +149,14 @@ async def readiness_check(request):
 
 
 # ============================================================================
-# Transport Implementations
+# HTTP Transport
 # ============================================================================
 
-async def run_stdio_transport():
-    """Run server in stdio mode (for Claude Desktop)."""
-    logger.info("=" * 70)
-    logger.info("CloudNativePG MCP Server (stdio mode)")
-    logger.info("=" * 70)
-    logger.info("Tools: 12 CloudNativePG management tools")
-    logger.info("=" * 70)
+def run_http_transport_auth0(host: str, port: int):
+    """Run server in HTTP mode with FastMCP Auth0 OAuth Proxy."""
+    from auth_fastmcp import create_auth0_oauth_proxy, get_auth0_config_summary, load_oidc_config_from_file
 
-    # Run stdio transport
-    await mcp.run_stdio_async()
-
-
-def run_http_transport(host: str, port: int):
-    """Run server in HTTP mode with FastMCP OAuth."""
-    from auth_fastmcp import create_auth0_oauth_proxy, get_auth_config_summary, load_oidc_config_from_file
-
-    logger.info("Initializing FastMCP OAuth Proxy for Auth0...")
+    logger.info("Initializing FastMCP Auth0 OAuth Proxy...")
 
     # Load configuration
     config = load_oidc_config_from_file() or {}
@@ -287,9 +169,9 @@ def run_http_transport(host: str, port: int):
     auth_proxy = create_auth0_oauth_proxy()
 
     # Log configuration summary
-    config_summary = get_auth_config_summary(issuer, audience, client_id, public_url)
+    config_summary = get_auth0_config_summary(issuer, audience, client_id, public_url)
     logger.info("=" * 80)
-    logger.info("FastMCP OAuth Configuration:")
+    logger.info("FastMCP Auth0 OAuth Configuration:")
     logger.info("=" * 80)
     for key, value in config_summary.items():
         logger.info(f"  {key}: {value}")
@@ -301,6 +183,16 @@ def run_http_transport(host: str, port: int):
     # Create app with OAuth at /mcp endpoint
     app = mcp.http_app(transport="http", path="/mcp")
 
+    # Add CORS middleware to handle OPTIONS preflight requests
+    from starlette.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Allow all origins (customize as needed)
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],  # Explicitly allow OPTIONS
+        allow_headers=["*"],
+    )
+
     # Add health check routes
     app.add_route("/healthz", liveness_check)
     app.add_route("/readyz", readiness_check)
@@ -311,8 +203,8 @@ def run_http_transport(host: str, port: int):
     logger.info("=" * 80)
     logger.info(f"  Listening on: {host}:{port}")
     logger.info(f"  MCP Endpoint: /mcp")
-    logger.info(f"  Auth: FastMCP OAuth Proxy (issues MCP tokens)")
-    logger.info("  Tools: 12 CloudNativePG management tools")
+    logger.info(f"  Auth Type: Auth0 (FastMCP OAuth Proxy)")
+    logger.info("  Server: cnpg-mcp")
     logger.info(f"  OAuth Discovery: /.well-known/oauth-authorization-server")
     logger.info(f"  Client Registration: /register")
     logger.info("=" * 80)
@@ -326,13 +218,177 @@ def run_http_transport(host: str, port: int):
     logger.info("    --token-file /tmp/mcp-token.txt")
     logger.info("")
 
+    # Add health check filter to uvicorn access logger
+    logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
+
     # Run server
     uvicorn.run(
         app,
         host=host,
         port=port,
-        log_level="info"
+        log_level="info",
+        ws="none"
     )
+
+
+def run_http_transport_keycloak(host: str, port: int):
+    """Run server in HTTP mode with FastMCP's native Keycloak auth provider.
+
+    Uses KeycloakAuthProvider from fastmcp>=3.2.4. Keycloak handles Dynamic
+    Client Registration natively (requires Keycloak >= 26.6.0), so no
+    client_id/client_secret, JWT signing key, or Redis storage is needed.
+    """
+    from auth_fastmcp import create_keycloak_auth_provider, get_keycloak_config_summary, load_oidc_config_from_file
+
+    logger.info("Initializing FastMCP Keycloak Auth Provider...")
+
+    # Load configuration (used for the logged summary)
+    config = load_oidc_config_from_file() or {}
+    realm_url = (
+        config.get("realm_url")
+        or config.get("issuer")
+        or os.getenv("KEYCLOAK_REALM_URL")
+        or os.getenv("OIDC_ISSUER")
+        or ""
+    )
+    audience = config.get("audience") or os.getenv("OIDC_AUDIENCE")
+    public_url = config.get("public_url") or os.getenv("PUBLIC_URL") or ""
+
+    auth_provider = create_keycloak_auth_provider()
+
+    config_summary = get_keycloak_config_summary(realm_url.rstrip("/"), audience, public_url)
+    logger.info("=" * 80)
+    logger.info("FastMCP Keycloak Configuration:")
+    logger.info("=" * 80)
+    for key, value in config_summary.items():
+        logger.info(f"  {key}: {value}")
+    logger.info("=" * 80)
+
+    mcp.auth = auth_provider
+
+    app = mcp.http_app(transport="http", path="/mcp")
+
+    from starlette.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
+
+    app.add_route("/healthz", liveness_check)
+    app.add_route("/readyz", readiness_check)
+
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("Server Configuration:")
+    logger.info("=" * 80)
+    logger.info(f"  Listening on: {host}:{port}")
+    logger.info(f"  MCP Endpoint: /mcp")
+    logger.info(f"  Auth Type: Keycloak (FastMCP KeycloakAuthProvider, DCR)")
+    logger.info("  Server: cnpg-mcp")
+    logger.info(f"  OAuth Discovery: /.well-known/oauth-authorization-server")
+    logger.info(f"  Client Registration: via Keycloak DCR")
+    logger.info("=" * 80)
+    logger.info("")
+    logger.info("To test with bearer token:")
+    logger.info("  ./test/test-mcp.py --transport http \\")
+    logger.info(f"    --url http://{host}:{port}/mcp \\")
+    logger.info("    --token <your-keycloak-jwt>")
+    logger.info("")
+
+    logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
+
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        ws="none"
+    )
+
+
+def run_http_transport_oidc(host: str, port: int):
+    """Run server in HTTP mode with generic OIDC authentication (Dex, Okta, etc.)."""
+    from auth_oidc import OIDCAuthProvider, OIDCAuthMiddleware
+
+    logger.info("Initializing Generic OIDC Authentication...")
+
+    # Create OIDC auth provider (auto-discovers from issuer)
+    auth_provider = OIDCAuthProvider()
+
+    # Create app WITHOUT built-in auth (we'll add middleware)
+    app = mcp.http_app(transport="http", path="/mcp")
+
+    # Add CORS middleware to handle OPTIONS preflight requests
+    from starlette.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Allow all origins (customize as needed)
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],  # Explicitly allow OPTIONS
+        allow_headers=["*"],
+    )
+
+    # Add OIDC authentication middleware
+    app.add_middleware(
+        OIDCAuthMiddleware,
+        auth_provider=auth_provider,
+        exclude_paths=["/healthz", "/readyz", "/.well-known/", "/register"]
+    )
+
+    # Add OAuth metadata routes
+    for route in auth_provider.get_metadata_routes():
+        app.add_route(route.path, route.endpoint, methods=route.methods)
+
+    # Add health check routes
+    app.add_route("/healthz", liveness_check)
+    app.add_route("/readyz", readiness_check)
+
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("Server Configuration:")
+    logger.info("=" * 80)
+    logger.info(f"  Listening on: {host}:{port}")
+    logger.info(f"  MCP Endpoint: /mcp")
+    logger.info(f"  Auth Type: Generic OIDC (Dex, Keycloak, etc.)")
+    logger.info(f"  Issuer: {auth_provider.issuer}")
+    logger.info(f"  Audience: {auth_provider.audience}")
+    logger.info("  Server: cnpg-mcp")
+    logger.info(f"  OAuth Discovery: /.well-known/oauth-authorization-server")
+    if auth_provider.upstream_dcr_endpoint:
+        logger.info(f"  Client Registration: /register (proxied)")
+    logger.info("=" * 80)
+    logger.info("")
+    logger.info("To test with bearer token:")
+    logger.info("  ./test/test-mcp.py --transport http \\")
+    logger.info(f"    --url http://{host}:{port}/mcp \\")
+    logger.info("    --token <your-jwt-token>")
+    logger.info("")
+
+    # Add health check filter to uvicorn access logger
+    logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
+
+    # Run server
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        ws="none"
+    )
+
+
+def run_http_transport(host: str, port: int):
+    """Run server in HTTP mode with configured authentication."""
+    auth_type = _resolve_auth_type()
+    if auth_type == "keycloak":
+        run_http_transport_keycloak(host, port)
+    elif auth_type == "oidc":
+        run_http_transport_oidc(host, port)
+    else:
+        run_http_transport_auth0(host, port)
 
 
 # ============================================================================
@@ -340,21 +396,15 @@ def run_http_transport(host: str, port: int):
 # ============================================================================
 
 def main():
-    """Main entry point with transport selection."""
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="CloudNativePG MCP Server"
-    )
-    parser.add_argument(
-        "--transport",
-        choices=["stdio", "http"],
-        default="stdio",
-        help="Transport mode: stdio (default) or http"
+        description="cnpg-mcp MCP Server"
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.getenv("PORT", "3000")),
-        help="Port for HTTP transport (default: 3000)"
+        default=int(os.getenv("PORT", "4200")),
+        help="Port for HTTP transport (default: 4200)"
     )
     parser.add_argument(
         "--host",
@@ -363,12 +413,7 @@ def main():
     )
 
     args = parser.parse_args()
-
-    if args.transport == "stdio":
-        import asyncio
-        asyncio.run(run_stdio_transport())
-    else:
-        run_http_transport(args.host, args.port)
+    run_http_transport(args.host, args.port)
 
 
 if __name__ == "__main__":

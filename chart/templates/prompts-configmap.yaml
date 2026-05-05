@@ -1,0 +1,31 @@
+{{- if .Values.prompts.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cnpg-mcp.fullname" . }}-prompts
+  labels:
+    {{- include "cnpg-mcp.labels" . | nindent 4 }}
+data:
+  prompts.yaml: |
+    version: {{ .Values.prompts.version | default "1.0.0" | quote }}
+    updated_at: {{ now | date "2006-01-02T15:04:05Z" | quote }}
+    prompts:
+      {{- if .Values.prompts.definitions }}
+      {{- toYaml .Values.prompts.definitions | nindent 6 }}
+      {{- else }}
+      # Example prompt - customize in values.yaml
+      - id: "example-prompt"
+        name: "Example Prompt"
+        description: "An example prompt template for {{ .Chart.Name }}"
+        template: |
+          This is an example prompt for {{ .Chart.Name }}.
+
+          User Input: {{"{{"}}{{"{{ input }}"}}{{"}}"}}"
+
+          Please process this request according to the server's capabilities.
+        arguments:
+          - name: input
+            description: "User input to process"
+            required: true
+      {{- end }}
+{{- end }}

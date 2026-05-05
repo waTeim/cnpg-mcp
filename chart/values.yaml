@@ -38,9 +38,45 @@ securityContext: {}
 
 service:
   type: ClusterIP
-  port: 4204
+  port: 4200
   # Test sidecar port (only used when testSidecar.enabled = true)
-  testPort: 3001
+  testPort: 4201
+
+# Test Sidecar Configuration
+# Runs the test server with --no-auth. Reachable ClusterIP-only / via
+# port-forward; never exposed through Ingress.
+testSidecar:
+  # Enable test sidecar container
+  enabled: false
+
+  # Image for the test sidecar. The default (empty repository) makes the
+  # deployment template auto-derive a test image name from image.repository
+  # by replacing the trailing "-server" suffix with "-test-server":
+  #
+  #   image.repository: wateim/myproj-server
+  #   → testSidecar image: wateim/myproj-test-server
+  #
+  # The test image is built by `make build-test` and is FROM the main image,
+  # adding only the *_test_server.py entrypoint. The sidecar MUST run this
+  # test image — the main image doesn't include the test server file by
+  # design (clean separation of test-only artifacts).
+  #
+  # Override repository explicitly if your registry uses a different naming
+  # convention, e.g.:
+  #   testSidecar:
+  #     image:
+  #       repository: wateim/some-other-test-image
+  image:
+    repository: ""  # empty → derive from image.repository (s/-server$/-test-server/)
+    tag: ""         # empty → use image.tag
+    pullPolicy: ""  # empty → use image.pullPolicy
+
+  # Mock identity injected by NoAuthMiddleware. Becomes both the `sub` and
+  # `preferred_username` claims; the issuer is fixed at http://localhost/no-auth.
+  identity: "test-user"
+
+  # Resource limits for test sidecar
+  resources: {}
 
 ingress:
   enabled: false
@@ -48,7 +84,7 @@ ingress:
   annotations: {}
     # kubernetes.io/ingress.class: nginx
     # kubernetes.io/tls-acme: "true"
-  # Single hostname for this MCP server (simplified from array)
+  # Single hostname for this MCP server
   host: "chart-example.local"
   # Path for the MCP endpoint (usually /)
   path: /
@@ -57,13 +93,8 @@ ingress:
   tls:
     enabled: false
     secretName: ""
-    # secretName: chart-example-tls
 
 resources: {}
-  # We usually recommend not to specify default resources and to leave this as a conscious
-  # choice for the user. This also increases chances charts run on environments with little
-  # resources, such as Minikube. If you do want to specify resources, uncomment the following
-  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
   # limits:
   #   cpu: 100m
   #   memory: 128Mi
@@ -84,75 +115,119 @@ tolerations: []
 
 affinity: {}
 
-# JWT Signing Key Secret
-# REQUIRED for production deployments (especially multi-replica)
-# Create using: python bin/create_jwt_secret.py --release-name <release-name>
+# JWT Signing Key Secret — Pattern A only.
+# Set jwt.enabled: false for Pattern B (Keycloak native DCR) deployments.
 jwt:
+  # Whether to mount a JWT signing key / storage encryption key Secret.
+  # Required for Pattern A (auth0, oidc). Must be false for Pattern B (keycloak).
+  enabled: true
+
   # Name of the Kubernetes secret containing the JWT signing key
-  # Secret should have key: jwt-signing-key
+  # Secret should have keys: jwt-signing-key, storage-encryption-key
   # Default: {{ .Release.Name }}-jwt-signing-key
   secretName: ""  # Leave empty to use default
 
 # OIDC/OAuth2 Authentication Configuration
-# REQUIRED for production HTTP mode deployment
+# REQUIRED for production HTTP mode deployment.
+# See mcp-base docs/cli-integration-contract.md for the full schema and pattern split.
 oidc:
-  # REQUIRED: OIDC Issuer URL (base URL of your identity provider)
+  # REQUIRED: Authentication type. Drives Pattern A vs Pattern B chart branches.
+  # You MUST set this to match the auth_type the scaffold was generated with —
+  # the entry point hard-codes the branch, the chart only configures it.
+  #
+  #   "keycloak" — FastMCP KeycloakAuthProvider (Pattern B; recommended for
+  #                MCP clients like Codex / Claude Desktop). Keycloak serves DCR
+  #                natively; no client_secret, JWT signing key, or Redis required.
+  #                Requires Keycloak >= 26.6.0 and fastmcp >= 3.2.4.
+  #                NOTE: Add `offline_access` to the realm's default client
+  #                scopes or DCR-registered MCP clients will receive no
+  #                refresh token (access tokens silently expire after ~5 min).
+  #   "auth0"    — FastMCP Auth0Provider OAuth proxy (Pattern A: local DCR,
+  #                Redis-backed sessions, JWT signing key required).
+  #   "oidc"     — generic OIDC middleware for other IdPs (Dex, Okta, Azure AD).
+  #                Pattern A; same Redis / JWT signing key requirements as auth0.
+  #                Publishes RFC 9728 / RFC 8414 / OIDC Discovery at the standard,
+  #                path-prefixed, and path-suffixed URL variants MCP clients probe.
+  authType: "keycloak"
+
+  # REQUIRED: OIDC Issuer URL (base URL of your identity provider).
+  # For Keycloak, this is the realm URL.
   # Examples:
-  #   Auth0: https://your-tenant.auth0.com
-  #   Keycloak: https://keycloak.example.com/realms/your-realm
-  #   Okta: https://your-org.okta.com/oauth2/default
-  #   Azure AD: https://login.microsoftonline.com/{tenant-id}/v2.0
-  issuer: "https://dev-15i-ae3b.auth0.com"
+  #   https://keycloak.example.com/realms/your-realm
+  #   https://your-org.okta.com/oauth2/default
+  #   https://login.microsoftonline.com/{tenant-id}/v2.0
+  issuer: "https://your-issuer.example.com"
 
   # REQUIRED: Expected audience claim in JWT tokens
-  # This should match what your IdP issues in the 'aud' claim
-  audience: "https://cnpg-mcp.wat.im/mcp"
+  audience: "https://your-api.example.com/mcp"
+
+  # REQUIRED for Pattern A. Ignored for Pattern B.
+  clientId: ""
+
+  # OPTIONAL (Pattern B): OAuth2 scopes required on incoming tokens.
+  # requiredScopes: ["openid"]
+
+  # OPTIONAL: Public URL of this MCP server (for OAuth callbacks)
+  # If not set, auto-generated from ingress.host
+  publicUrl: ""
+
+  # OPTIONAL (Pattern A): credentials secret override
+  # Default: {{ .Release.Name }}-oidc-credentials
+  credentialsSecretName: ""
+
+  # OPTIONAL (Pattern A): client secret key inside the credentials secret
+  clientSecretKey: ""
 
   # OPTIONAL: Override JWKS URI (auto-discovered from issuer by default)
-  # Only set if your IdP doesn't support OIDC discovery
   # jwksUri: ""
-
-  # OPTIONAL: DCR (Dynamic Client Registration) proxy URL
-  # Use if your IdP doesn't support RFC 7591 DCR natively
-  # dcrProxyUrl: ""
 
   # OPTIONAL: Required OAuth2 scope (default: openid)
   # scope: "openid"
 
-  # NOTE: Auth0 credentials secret is automatically derived from release name
-  # Secret name will be: {{ .Release.Name }}-auth0-credentials
-  #
-  # Create the secret using:
-  #   python bin/create_secrets.py --namespace <namespace> --release-name <release-name>
-  #
-  # The secret must contain:
-  #   - server-client-id: Server client ID (for FastMCP)
-  #   - server-client-secret: Server client secret (for FastMCP)
-  #   - mgmt-client-id: Management API client ID (for scripts)
-  #   - mgmt-client-secret: Management API client secret (for scripts)
-  #   - auth0-domain: Auth0 domain
-  #   - connection-id: Auth0 connection ID
+# Operator RBAC Configuration
+# The chart creates namespaced permissions for CloudNativePG clusters,
+# Database CRDs, and role/database secrets in the release namespace by default.
+rbac:
+  # Additional namespaces where the MCP deployment service account can manage
+  # CloudNativePG resources. The service account remains in the release
+  # namespace, but receives a RoleBinding in each target namespace.
+  targetNamespaces: []
 
-# Test Sidecar Configuration
-# Enables a second container for testing using standard OIDC authentication
-testSidecar:
-  # Enable test sidecar container
-  enabled: false
+  # Grant the MCP deployment service account access in every namespace. This is
+  # convenient for shared control-plane deployments, but broad because it grants
+  # secret permissions cluster-wide.
+  clusterWide: false
 
-  # Image for test sidecar (defaults to main image)
-  image:
-    repository: ""  # Leave empty to use main image
-    tag: ""         # Leave empty to use main image tag
-    pullPolicy: ""  # Leave empty to use main image pullPolicy
+  # Add ClusterRole names here only when your operator installation provides
+  # extra roles you also want bound. These are bound in each target namespace,
+  # or cluster-wide when rbac.clusterWide is true.
+  operatorClusterRoles: []
 
-  # Resource limits for test sidecar
-  resources: {}
-    # limits:
-    #   cpu: 200m
-    #   memory: 256Mi
-    # requests:
-    #   cpu: 100m
-    #   memory: 128Mi
+# Prompt Management Configuration
+# Prompts are loaded from a ConfigMap and can be hot-reloaded
+prompts:
+  # Enable prompt management
+  enabled: true
+
+  # Prompt bundle version (semver)
+  version: "1.0.0"
+
+  # Prompt definitions
+  # Customize or replace these with your own prompts
+  definitions:
+    - id: "example-prompt"
+      name: "Example Prompt"
+      description: "An example prompt template"
+      template: |
+        This is an example prompt for cnpg-mcp.
+
+        User Input: {{ input }}"
+
+        Please process this request according to the server's capabilities.
+      arguments:
+        - name: input
+          description: "User input to process"
+          required: true
 
 # Redis Configuration
 # Used for OAuth session persistence across restarts
@@ -166,7 +241,7 @@ redis:
   # Number of replicas (only for replication/cluster modes)
   replicaCount: 1
 
-  # Redis server configuration (pass-through to redis.conf)
+  # Redis server configuration
   master:
     configuration: |
       maxmemory 256mb
@@ -216,6 +291,4 @@ redis:
   # Authentication
   auth:
     enabled: false
-    # For internal session storage, authentication is not required
-    # If enabled, password will be stored in secret: {{ .Release.Name }}-redis
     password: ""
