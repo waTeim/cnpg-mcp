@@ -114,6 +114,7 @@ class ServerInfoTest(TestPlugin):
             "update_postgres_role",
             "delete_postgres_role",
             "list_postgres_databases",
+            "get_postgres_database_status",
             "create_postgres_database",
             "delete_postgres_database",
         }
@@ -514,7 +515,7 @@ class CreatePostgresDatabaseTest(TestPlugin):
 class VerifyDatabaseCreatedTest(TestPlugin):
     """Verify created database appears in list output."""
 
-    tool_name = "list_postgres_databases"
+    tool_name = "get_postgres_database_status"
     description = "Verify created database appears in database list"
     depends_on = ["CreatePostgresDatabaseTest"]
     run_after = ["CreatePostgresDatabaseTest"]
@@ -527,12 +528,18 @@ class VerifyDatabaseCreatedTest(TestPlugin):
         if not _include_integration(ctx) or not cluster_name or not database_name:
             return _skip(self, start_time, "no integration database available")
         try:
-            response_text = await _call_text(session, self.tool_name, _with_namespace({"cluster_name": cluster_name}))
+            response_text = await _call_text(
+                session,
+                self.tool_name,
+                _with_namespace({"cluster_name": cluster_name, "database_name": database_name}),
+            )
             if failure := _operational_failure(self, start_time, "Tool executed but operation failed", response_text):
                 return failure
             if database_name not in response_text:
                 return TestResult(self.get_name(), self.tool_name, False, f"Created database '{database_name}' not found", response_text[:500], (time.time() - start_time) * 1000)
-            return TestResult(self.get_name(), self.tool_name, True, f"Verified database '{database_name}' appears in database list", duration_ms=(time.time() - start_time) * 1000)
+            if "Current Locale/Encoding Values" not in response_text:
+                return TestResult(self.get_name(), self.tool_name, False, "Database status response missing locale/encoding values", response_text[:500], (time.time() - start_time) * 1000)
+            return TestResult(self.get_name(), self.tool_name, True, f"Verified database '{database_name}' status and create-time values", duration_ms=(time.time() - start_time) * 1000)
         except Exception as e:
             return TestResult(self.get_name(), self.tool_name, False, "Test failed with exception", str(e), (time.time() - start_time) * 1000)
 

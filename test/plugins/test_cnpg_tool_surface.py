@@ -16,6 +16,7 @@ EXPECTED_CNPG_TOOLS = {
     "update_postgres_role",
     "delete_postgres_role",
     "list_postgres_databases",
+    "get_postgres_database_status",
     "create_postgres_database",
     "delete_postgres_database",
 }

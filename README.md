@@ -21,6 +21,7 @@ The server exposes the CloudNativePG tools from the v1 implementation:
 - `update_postgres_role`
 - `delete_postgres_role`
 - `list_postgres_databases`
+- `get_postgres_database_status`
 - `create_postgres_database`
 - `delete_postgres_database`
 
@@ -28,6 +29,8 @@ The server exposes the CloudNativePG tools from the v1 implementation:
 locale options, including `encoding`, `locale`, `locale_provider`,
 `locale_collate`, `locale_ctype`, `icu_locale`, `icu_rules`,
 `builtin_locale`, and `collation_version`.
+`get_postgres_database_status` reports the current Database CRD spec values for
+those options along with the operator reconciliation status.
 
 It also includes MCP Base scaffold admin tools for prompt management:
 

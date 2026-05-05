@@ -266,15 +266,50 @@ def truncate_response(content: str, max_length: int = CHARACTER_LIMIT) -> str:
     return f"{truncated}\n\n... (truncated, {len(content) - max_length} characters omitted)"
 
 
-def format_database_create_options(spec: Dict[str, Any]) -> str:
+def format_database_create_options(spec: Dict[str, Any], include_unset: bool = False) -> str:
     """Format optional Database CRD CREATE DATABASE parameters."""
-    lines = [
-        f"- {label}: {spec[field]}"
-        for field, label in DATABASE_CREATE_OPTION_LABELS.items()
-        if field in spec
-    ]
+    lines = []
+    for field, label in DATABASE_CREATE_OPTION_LABELS.items():
+        if field in spec:
+            lines.append(f"- {label}: {spec[field]}")
+        elif include_unset:
+            lines.append(f"- {label}: not set")
     if not lines:
         return "- Defaults: inherited from PostgreSQL/template settings"
+    return "\n".join(lines)
+
+
+def database_create_options_dict(spec: Dict[str, Any], include_unset: bool = False) -> Dict[str, Any]:
+    """Return Database CRD CREATE DATABASE parameters as a structured dict."""
+    return {
+        field: spec.get(field)
+        for field in DATABASE_CREATE_OPTION_LABELS
+        if include_unset or field in spec
+    }
+
+
+def format_database_object_status(status: Dict[str, Any]) -> str:
+    """Format Database CRD reconciliation status."""
+    if not status:
+        return "- Status: not reported by the operator yet"
+
+    lines = [
+        f"- Applied: {status.get('applied', 'unknown')}",
+        f"- Observed Generation: {status.get('observedGeneration', 'unknown')}",
+        f"- Message: {status.get('message', 'none')}",
+    ]
+
+    for object_type in ("schemas", "extensions", "fdws", "servers"):
+        objects = status.get(object_type) or []
+        if not objects:
+            continue
+        lines.append(f"- {object_type.title()}:")
+        for item in objects:
+            name = item.get("name", "unknown")
+            applied = item.get("applied", "unknown")
+            message = item.get("message", "none")
+            lines.append(f"  - {name}: applied={applied}, message={message}")
+
     return "\n".join(lines)
 
 
@@ -377,6 +412,57 @@ async def patch_cnpg_cluster_spec(namespace: str, name: str, spec_patch: Dict[st
         )
     except ApiException as e:
         raise Exception(format_error_message(e, f"patching cluster {namespace}/{name}"))
+
+
+async def get_cnpg_database(namespace: str, cluster_name: str, database_name: str) -> Dict[str, Any]:
+    """
+    Get a Database CRD by logical database name.
+
+    The create/delete tools use <cluster>-<database> as the CRD name, but users
+    can create Database CRDs with custom metadata names. Try the conventional
+    name first, then fall back to matching spec.cluster.name and spec.name.
+    """
+    custom_api, _ = get_kubernetes_clients()
+    expected_crd_name = f"{cluster_name}-{database_name}"
+
+    try:
+        database = await asyncio.to_thread(
+            custom_api.get_namespaced_custom_object,
+            group=CNPG_GROUP,
+            version=CNPG_VERSION,
+            namespace=namespace,
+            plural=CNPG_DATABASE_PLURAL,
+            name=expected_crd_name,
+        )
+        spec = database.get("spec", {})
+        if spec.get("cluster", {}).get("name") == cluster_name and spec.get("name") == database_name:
+            return database
+    except ApiException as e:
+        if e.status != 404:
+            raise Exception(format_error_message(e, f"getting database {namespace}/{expected_crd_name}"))
+
+    try:
+        databases = await asyncio.to_thread(
+            custom_api.list_namespaced_custom_object,
+            group=CNPG_GROUP,
+            version=CNPG_VERSION,
+            namespace=namespace,
+            plural=CNPG_DATABASE_PLURAL,
+        )
+    except ApiException as e:
+        raise Exception(format_error_message(e, f"listing databases for cluster {namespace}/{cluster_name}"))
+
+    matches = [
+        db for db in databases.get("items", [])
+        if db.get("spec", {}).get("cluster", {}).get("name") == cluster_name
+        and db.get("spec", {}).get("name") == database_name
+    ]
+    if not matches:
+        raise Exception(f"Database CRD for database '{database_name}' in cluster '{namespace}/{cluster_name}' was not found.")
+    if len(matches) > 1:
+        names = ", ".join(db.get("metadata", {}).get("name", "unknown") for db in matches)
+        raise Exception(f"Multiple Database CRDs match database '{database_name}' in cluster '{namespace}/{cluster_name}': {names}")
+    return matches[0]
 
 
 def format_cluster_status(cluster: Dict[str, Any], detail_level: str = "concise") -> str:
@@ -622,6 +708,16 @@ class DeleteRoleInput(BaseModel):
 class ListDatabasesInput(BaseModel):
     """Input for listing PostgreSQL databases."""
     cluster_name: str = Field(..., description="Name of the PostgreSQL cluster.")
+    namespace: Optional[str] = Field(
+        None,
+        description="Kubernetes namespace where the cluster exists. If not specified, uses the current namespace from your Kubernetes context."
+    )
+
+
+class GetDatabaseStatusInput(BaseModel):
+    """Input for getting PostgreSQL database status."""
+    cluster_name: str = Field(..., description="Name of the PostgreSQL cluster.")
+    database_name: str = Field(..., description="Name of the database inside PostgreSQL.")
     namespace: Optional[str] = Field(
         None,
         description="Kubernetes namespace where the cluster exists. If not specified, uses the current namespace from your Kubernetes context."
@@ -2040,6 +2136,70 @@ async def list_postgres_databases(
         return format_error_message(e, f"listing databases for cluster {namespace}/{cluster_name}")
 
 
+@with_mcp_context
+async def get_postgres_database_status(
+    context: MCPContext,
+    cluster_name: str,
+    database_name: str,
+    namespace: Optional[str] = None,
+    format: Literal["text", "json"] = "text"
+) -> str:
+    """
+    Get the current Database CRD status and configured create-time options.
+
+    Args:
+        cluster_name: Name of the PostgreSQL cluster.
+        database_name: Name of the database inside PostgreSQL.
+        namespace: Kubernetes namespace where the cluster exists.
+        format: Output format. 'text' for human-readable (default), 'json' for structured
+               data that can be programmatically consumed.
+
+    Returns:
+        Database CRD metadata, current spec values for encoding/collation/locale options,
+        and operator reconciliation status.
+    """
+    try:
+        if namespace is None:
+            namespace = get_current_namespace()
+
+        database = await get_cnpg_database(namespace, cluster_name, database_name)
+        metadata = database.get("metadata", {})
+        spec = database.get("spec", {})
+        status = database.get("status", {})
+
+        if format == "json":
+            return json.dumps({
+                "cluster": f"{namespace}/{cluster_name}",
+                "crd_name": metadata.get("name", "unknown"),
+                "database_name": spec.get("name", database_name),
+                "owner": spec.get("owner", "unknown"),
+                "ensure": spec.get("ensure", "present"),
+                "reclaim_policy": spec.get("databaseReclaimPolicy", "retain"),
+                "generation": metadata.get("generation"),
+                "resource_version": metadata.get("resourceVersion"),
+                "create_options": database_create_options_dict(spec, include_unset=True),
+                "status": status,
+            }, indent=2)
+
+        result = f"**Database: {namespace}/{metadata.get('name', 'unknown')}**\n"
+        result += f"- PostgreSQL Database Name: {spec.get('name', database_name)}\n"
+        result += f"- Cluster: {namespace}/{cluster_name}\n"
+        result += f"- Owner: {spec.get('owner', 'unknown')}\n"
+        result += f"- Ensure: {spec.get('ensure', 'present')}\n"
+        result += f"- Reclaim Policy: {spec.get('databaseReclaimPolicy', 'retain')}\n"
+        result += f"- Generation: {metadata.get('generation', 'unknown')}\n"
+        result += f"- Resource Version: {metadata.get('resourceVersion', 'unknown')}\n"
+        result += "\nCurrent Locale/Encoding Values:\n"
+        result += format_database_create_options(spec, include_unset=True)
+        result += "\n\nOperator Status:\n"
+        result += format_database_object_status(status)
+        result += "\n"
+        return result
+
+    except Exception as e:
+        return format_error_message(e, f"getting database status for {namespace}/{cluster_name}/{database_name}")
+
+
 
 @with_mcp_context
 async def create_postgres_database(
@@ -2342,6 +2502,7 @@ def register_resources(mcp):
             "update_postgres_role",
             "delete_postgres_role",
             "list_postgres_databases",
+            "get_postgres_database_status",
             "create_postgres_database",
             "delete_postgres_database",
         ]
@@ -2616,6 +2777,23 @@ def register_tools(mcp):
         return await list_postgres_databases(
             context=ctx,
             cluster_name=cluster_name,
+            namespace=namespace,
+            format=format,
+        )
+
+    @mcp.tool(name="get_postgres_database_status")
+    async def get_postgres_database_status_tool(
+        cluster_name: str,
+        database_name: str,
+        namespace: Optional[str] = None,
+        format: Literal["text", "json"] = "text",
+        ctx: Context = None,
+    ) -> str:
+        """Get a CloudNativePG Database CRD's current spec values and reconciliation status."""
+        return await get_postgres_database_status(
+            context=ctx,
+            cluster_name=cluster_name,
+            database_name=database_name,
             namespace=namespace,
             format=format,
         )
