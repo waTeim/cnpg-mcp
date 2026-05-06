@@ -408,7 +408,6 @@ async def patch_cnpg_cluster_spec(namespace: str, name: str, spec_patch: Dict[st
             plural=CNPG_PLURAL,
             name=name,
             body={"spec": spec_patch},
-            _content_type="application/merge-patch+json",
         )
     except ApiException as e:
         raise Exception(format_error_message(e, f"patching cluster {namespace}/{name}"))
@@ -1751,11 +1750,27 @@ To create this role, call create_postgres_role again with dry_run=False (or omit
 
         cluster['spec']['managed']['roles'].append(new_role)
 
-        await patch_cnpg_cluster_spec(
-            namespace,
-            cluster_name,
-            {"managed": {"roles": cluster["spec"]["managed"]["roles"]}},
-        )
+        try:
+            await patch_cnpg_cluster_spec(
+                namespace,
+                cluster_name,
+                {"managed": {"roles": cluster["spec"]["managed"]["roles"]}},
+            )
+        except Exception:
+            try:
+                await asyncio.to_thread(
+                    core_api.delete_namespaced_secret,
+                    name=secret_name,
+                    namespace=namespace,
+                )
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Failed to clean up role password secret %s/%s after cluster patch failed: %s",
+                    namespace,
+                    secret_name,
+                    cleanup_error,
+                )
+            raise
 
         return f"""Successfully created PostgreSQL role '{role_name}' in cluster '{namespace}/{cluster_name}'.
 
