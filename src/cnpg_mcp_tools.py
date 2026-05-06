@@ -464,6 +464,37 @@ async def get_cnpg_database(namespace: str, cluster_name: str, database_name: st
     return matches[0]
 
 
+async def read_role_secret(namespace: str, secret_name: str) -> Optional[Any]:
+    """Read a role password Secret, returning None when it does not exist."""
+    _, core_api = get_kubernetes_clients()
+    try:
+        return await asyncio.to_thread(
+            core_api.read_namespaced_secret,
+            name=secret_name,
+            namespace=namespace,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+
+
+async def delete_role_secret(namespace: str, secret_name: str) -> bool:
+    """Delete a role password Secret, returning whether a Secret was deleted."""
+    _, core_api = get_kubernetes_clients()
+    try:
+        await asyncio.to_thread(
+            core_api.delete_namespaced_secret,
+            name=secret_name,
+            namespace=namespace,
+        )
+        return True
+    except ApiException as e:
+        if e.status == 404:
+            return False
+        raise
+
+
 def format_cluster_status(cluster: Dict[str, Any], detail_level: str = "concise") -> str:
     """Format cluster status in a human-readable way."""
     metadata = cluster.get('metadata', {})
@@ -1758,11 +1789,7 @@ To create this role, call create_postgres_role again with dry_run=False (or omit
             )
         except Exception:
             try:
-                await asyncio.to_thread(
-                    core_api.delete_namespaced_secret,
-                    name=secret_name,
-                    namespace=namespace,
-                )
+                await delete_role_secret(namespace, secret_name)
             except Exception as cleanup_error:
                 logger.warning(
                     "Failed to clean up role password secret %s/%s after cluster patch failed: %s",
@@ -1969,49 +1996,47 @@ async def delete_postgres_role(
         # Get the cluster
         cluster = await get_cnpg_cluster(namespace, cluster_name)
         managed_roles = cluster.get('spec', {}).get('managed', {}).get('roles', [])
+        secret_name = f"cnpg-{cluster_name}-user-{role_name}"
 
         # Find the role
         role_index = next((i for i, r in enumerate(managed_roles) if r.get('name') == role_name), None)
-        if role_index is None:
-            return f"Error: Role '{role_name}' not found in cluster '{namespace}/{cluster_name}'."
-
-        role = managed_roles[role_index]
+        role = managed_roles[role_index] if role_index is not None else None
 
         # If dry_run, show what would be deleted
         if dry_run:
-            secret_name = f"cnpg-{cluster_name}-user-{role_name}"
-
             # Check if secret exists
-            _, core_api = get_kubernetes_clients()
-            try:
-                await asyncio.to_thread(
-                    core_api.read_namespaced_secret,
-                    name=secret_name,
-                    namespace=namespace
-                )
-                secret_exists = True
-            except ApiException:
-                secret_exists = False
+            secret_exists = await read_role_secret(namespace, secret_name) is not None
 
             return f"""Dry run: Deletion preview for role '{role_name}' in cluster '{namespace}/{cluster_name}'
 
 Role details:
-- Login: {role.get('login', False)}
-- Superuser: {role.get('superuser', False)}
-- Inherit: {role.get('inherit', True)}
-- Create DB: {role.get('createdb', False)}
-- Create Role: {role.get('createrole', False)}
-- Replication: {role.get('replication', False)}
+- Managed Role Entry: {'exists' if role else 'not found'}
+{f"- Login: {role.get('login', False)}" if role else "- Login: unknown"}
+{f"- Superuser: {role.get('superuser', False)}" if role else "- Superuser: unknown"}
+{f"- Inherit: {role.get('inherit', True)}" if role else "- Inherit: unknown"}
+{f"- Create DB: {role.get('createdb', False)}" if role else "- Create DB: unknown"}
+{f"- Create Role: {role.get('createrole', False)}" if role else "- Create Role: unknown"}
+{f"- Replication: {role.get('replication', False)}" if role else "- Replication: unknown"}
 
 Resources that would be deleted:
-- Role definition from .spec.managed.roles in cluster CRD
+- Role definition from .spec.managed.roles in cluster CRD {'(exists)' if role else '(not found; no cluster patch needed)'}
 - Kubernetes secret: {secret_name} {'(exists)' if secret_exists else '(not found)'}
 
-WARNING: This operation will drop the role from PostgreSQL.
+WARNING: If the managed role entry exists, this operation will drop the role from PostgreSQL.
 Any objects owned by this role or permissions granted to it will be affected.
 
 To proceed with deletion, call delete_postgres_role again with dry_run=False (or omit the dry_run parameter).
 """
+
+        if role_index is None:
+            secret_deleted = await delete_role_secret(namespace, secret_name)
+            if secret_deleted:
+                return f"""Cleaned up orphaned PostgreSQL role secret for '{role_name}' in cluster '{namespace}/{cluster_name}'.
+
+The role was not present in .spec.managed.roles, so no cluster patch was needed.
+Deleted orphaned secret: {secret_name}
+"""
+            return f"Error: Role '{role_name}' not found in cluster '{namespace}/{cluster_name}', and associated secret '{secret_name}' was not found."
 
         # Remove the role from the list
         managed_roles.pop(role_index)
@@ -2023,19 +2048,7 @@ To proceed with deletion, call delete_postgres_role again with dry_run=False (or
         )
 
         # Delete the associated secret
-        secret_name = f"cnpg-{cluster_name}-user-{role_name}"
-        _, core_api = get_kubernetes_clients()
-
-        try:
-            await asyncio.to_thread(
-                core_api.delete_namespaced_secret,
-                name=secret_name,
-                namespace=namespace
-            )
-            secret_deleted = True
-        except ApiException:
-            # Secret doesn't exist or already deleted
-            secret_deleted = False
+        secret_deleted = await delete_role_secret(namespace, secret_name)
 
         secret_msg = f"\nAssociated secret '{secret_name}' was also deleted." if secret_deleted else ""
 
