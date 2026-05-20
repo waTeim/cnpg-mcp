@@ -95,6 +95,18 @@ CNPG_VERSION = "v1"
 CNPG_PLURAL = "clusters"
 CNPG_DATABASE_PLURAL = "databases"
 
+DATABASE_CREATE_OPTION_LABELS = {
+    "encoding": "Encoding",
+    "locale": "Locale",
+    "localeProvider": "Locale Provider",
+    "localeCollate": "LC_COLLATE",
+    "localeCType": "LC_CTYPE",
+    "icuLocale": "ICU Locale",
+    "icuRules": "ICU Rules",
+    "builtinLocale": "Builtin Locale",
+    "collationVersion": "Collation Version",
+}
+
 # Transport mode (set via CLI args)
 TRANSPORT_MODE = "stdio"  # or "http"
 
@@ -254,6 +266,53 @@ def truncate_response(content: str, max_length: int = CHARACTER_LIMIT) -> str:
     return f"{truncated}\n\n... (truncated, {len(content) - max_length} characters omitted)"
 
 
+def format_database_create_options(spec: Dict[str, Any], include_unset: bool = False) -> str:
+    """Format optional Database CRD CREATE DATABASE parameters."""
+    lines = []
+    for field, label in DATABASE_CREATE_OPTION_LABELS.items():
+        if field in spec:
+            lines.append(f"- {label}: {spec[field]}")
+        elif include_unset:
+            lines.append(f"- {label}: not set")
+    if not lines:
+        return "- Defaults: inherited from PostgreSQL/template settings"
+    return "\n".join(lines)
+
+
+def database_create_options_dict(spec: Dict[str, Any], include_unset: bool = False) -> Dict[str, Any]:
+    """Return Database CRD CREATE DATABASE parameters as a structured dict."""
+    return {
+        field: spec.get(field)
+        for field in DATABASE_CREATE_OPTION_LABELS
+        if include_unset or field in spec
+    }
+
+
+def format_database_object_status(status: Dict[str, Any]) -> str:
+    """Format Database CRD reconciliation status."""
+    if not status:
+        return "- Status: not reported by the operator yet"
+
+    lines = [
+        f"- Applied: {status.get('applied', 'unknown')}",
+        f"- Observed Generation: {status.get('observedGeneration', 'unknown')}",
+        f"- Message: {status.get('message', 'none')}",
+    ]
+
+    for object_type in ("schemas", "extensions", "fdws", "servers"):
+        objects = status.get(object_type) or []
+        if not objects:
+            continue
+        lines.append(f"- {object_type.title()}:")
+        for item in objects:
+            name = item.get("name", "unknown")
+            applied = item.get("applied", "unknown")
+            message = item.get("message", "none")
+            lines.append(f"  - {name}: applied={applied}, message={message}")
+
+    return "\n".join(lines)
+
+
 def format_error_message(error: Exception, context: str = "") -> str:
     """Format error messages in an LLM-friendly, actionable way."""
     if isinstance(error, ApiException):
@@ -349,10 +408,91 @@ async def patch_cnpg_cluster_spec(namespace: str, name: str, spec_patch: Dict[st
             plural=CNPG_PLURAL,
             name=name,
             body={"spec": spec_patch},
-            _content_type="application/merge-patch+json",
         )
     except ApiException as e:
         raise Exception(format_error_message(e, f"patching cluster {namespace}/{name}"))
+
+
+async def get_cnpg_database(namespace: str, cluster_name: str, database_name: str) -> Dict[str, Any]:
+    """
+    Get a Database CRD by logical database name.
+
+    The create/delete tools use <cluster>-<database> as the CRD name, but users
+    can create Database CRDs with custom metadata names. Try the conventional
+    name first, then fall back to matching spec.cluster.name and spec.name.
+    """
+    custom_api, _ = get_kubernetes_clients()
+    expected_crd_name = f"{cluster_name}-{database_name}"
+
+    try:
+        database = await asyncio.to_thread(
+            custom_api.get_namespaced_custom_object,
+            group=CNPG_GROUP,
+            version=CNPG_VERSION,
+            namespace=namespace,
+            plural=CNPG_DATABASE_PLURAL,
+            name=expected_crd_name,
+        )
+        spec = database.get("spec", {})
+        if spec.get("cluster", {}).get("name") == cluster_name and spec.get("name") == database_name:
+            return database
+    except ApiException as e:
+        if e.status != 404:
+            raise Exception(format_error_message(e, f"getting database {namespace}/{expected_crd_name}"))
+
+    try:
+        databases = await asyncio.to_thread(
+            custom_api.list_namespaced_custom_object,
+            group=CNPG_GROUP,
+            version=CNPG_VERSION,
+            namespace=namespace,
+            plural=CNPG_DATABASE_PLURAL,
+        )
+    except ApiException as e:
+        raise Exception(format_error_message(e, f"listing databases for cluster {namespace}/{cluster_name}"))
+
+    matches = [
+        db for db in databases.get("items", [])
+        if db.get("spec", {}).get("cluster", {}).get("name") == cluster_name
+        and db.get("spec", {}).get("name") == database_name
+    ]
+    if not matches:
+        raise Exception(f"Database CRD for database '{database_name}' in cluster '{namespace}/{cluster_name}' was not found.")
+    if len(matches) > 1:
+        names = ", ".join(db.get("metadata", {}).get("name", "unknown") for db in matches)
+        raise Exception(f"Multiple Database CRDs match database '{database_name}' in cluster '{namespace}/{cluster_name}': {names}")
+    return matches[0]
+
+
+async def read_role_secret(namespace: str, secret_name: str) -> Optional[Any]:
+    """Read a role password Secret, returning None when it does not exist."""
+    _, core_api = get_kubernetes_clients()
+    try:
+        return await asyncio.to_thread(
+            core_api.read_namespaced_secret,
+            name=secret_name,
+            namespace=namespace,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+
+
+async def delete_role_secret(namespace: str, secret_name: str) -> bool:
+    """Delete a role password Secret, returning whether a Secret was deleted."""
+    _, core_api = get_kubernetes_clients()
+    try:
+        await asyncio.to_thread(
+            core_api.delete_namespaced_secret,
+            name=secret_name,
+            namespace=namespace,
+        )
+        return True
+    except ApiException as e:
+        if e.status == 404:
+            return False
+        raise
 
 
 def format_cluster_status(cluster: Dict[str, Any], detail_level: str = "concise") -> str:
@@ -604,6 +744,16 @@ class ListDatabasesInput(BaseModel):
     )
 
 
+class GetDatabaseStatusInput(BaseModel):
+    """Input for getting PostgreSQL database status."""
+    cluster_name: str = Field(..., description="Name of the PostgreSQL cluster.")
+    database_name: str = Field(..., description="Name of the database inside PostgreSQL.")
+    namespace: Optional[str] = Field(
+        None,
+        description="Kubernetes namespace where the cluster exists. If not specified, uses the current namespace from your Kubernetes context."
+    )
+
+
 class CreateDatabaseInput(BaseModel):
     """Input for creating a PostgreSQL database."""
     cluster_name: str = Field(..., description="Name of the PostgreSQL cluster.")
@@ -618,6 +768,42 @@ class CreateDatabaseInput(BaseModel):
     reclaim_policy: Literal["retain", "delete"] = Field(
         "retain",
         description="Policy for database deletion. 'retain' keeps the database when the CRD is deleted, 'delete' removes it."
+    )
+    encoding: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE ENCODING value, for example UTF8. Immutable after creation."
+    )
+    locale: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE LOCALE value. Sets default collation order and character classification. Immutable after creation."
+    )
+    locale_provider: Optional[Literal["builtin", "icu", "libc"]] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE LOCALE_PROVIDER value. PostgreSQL 16+ supports this for databases."
+    )
+    locale_collate: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE LC_COLLATE value. Immutable after creation."
+    )
+    locale_ctype: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE LC_CTYPE value. Immutable after creation."
+    )
+    icu_locale: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE ICU_LOCALE value. Requires locale_provider='icu'."
+    )
+    icu_rules: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE ICU_RULES value. Requires locale_provider='icu'."
+    )
+    builtin_locale: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE BUILTIN_LOCALE value. Requires locale_provider='builtin'."
+    )
+    collation_version: Optional[str] = Field(
+        None,
+        description="Optional PostgreSQL CREATE DATABASE COLLATION_VERSION value. Immutable after creation."
     )
     namespace: Optional[str] = Field(
         None,
@@ -1595,11 +1781,23 @@ To create this role, call create_postgres_role again with dry_run=False (or omit
 
         cluster['spec']['managed']['roles'].append(new_role)
 
-        await patch_cnpg_cluster_spec(
-            namespace,
-            cluster_name,
-            {"managed": {"roles": cluster["spec"]["managed"]["roles"]}},
-        )
+        try:
+            await patch_cnpg_cluster_spec(
+                namespace,
+                cluster_name,
+                {"managed": {"roles": cluster["spec"]["managed"]["roles"]}},
+            )
+        except Exception:
+            try:
+                await delete_role_secret(namespace, secret_name)
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Failed to clean up role password secret %s/%s after cluster patch failed: %s",
+                    namespace,
+                    secret_name,
+                    cleanup_error,
+                )
+            raise
 
         return f"""Successfully created PostgreSQL role '{role_name}' in cluster '{namespace}/{cluster_name}'.
 
@@ -1798,49 +1996,47 @@ async def delete_postgres_role(
         # Get the cluster
         cluster = await get_cnpg_cluster(namespace, cluster_name)
         managed_roles = cluster.get('spec', {}).get('managed', {}).get('roles', [])
+        secret_name = f"cnpg-{cluster_name}-user-{role_name}"
 
         # Find the role
         role_index = next((i for i, r in enumerate(managed_roles) if r.get('name') == role_name), None)
-        if role_index is None:
-            return f"Error: Role '{role_name}' not found in cluster '{namespace}/{cluster_name}'."
-
-        role = managed_roles[role_index]
+        role = managed_roles[role_index] if role_index is not None else None
 
         # If dry_run, show what would be deleted
         if dry_run:
-            secret_name = f"cnpg-{cluster_name}-user-{role_name}"
-
             # Check if secret exists
-            _, core_api = get_kubernetes_clients()
-            try:
-                await asyncio.to_thread(
-                    core_api.read_namespaced_secret,
-                    name=secret_name,
-                    namespace=namespace
-                )
-                secret_exists = True
-            except ApiException:
-                secret_exists = False
+            secret_exists = await read_role_secret(namespace, secret_name) is not None
 
             return f"""Dry run: Deletion preview for role '{role_name}' in cluster '{namespace}/{cluster_name}'
 
 Role details:
-- Login: {role.get('login', False)}
-- Superuser: {role.get('superuser', False)}
-- Inherit: {role.get('inherit', True)}
-- Create DB: {role.get('createdb', False)}
-- Create Role: {role.get('createrole', False)}
-- Replication: {role.get('replication', False)}
+- Managed Role Entry: {'exists' if role else 'not found'}
+{f"- Login: {role.get('login', False)}" if role else "- Login: unknown"}
+{f"- Superuser: {role.get('superuser', False)}" if role else "- Superuser: unknown"}
+{f"- Inherit: {role.get('inherit', True)}" if role else "- Inherit: unknown"}
+{f"- Create DB: {role.get('createdb', False)}" if role else "- Create DB: unknown"}
+{f"- Create Role: {role.get('createrole', False)}" if role else "- Create Role: unknown"}
+{f"- Replication: {role.get('replication', False)}" if role else "- Replication: unknown"}
 
 Resources that would be deleted:
-- Role definition from .spec.managed.roles in cluster CRD
+- Role definition from .spec.managed.roles in cluster CRD {'(exists)' if role else '(not found; no cluster patch needed)'}
 - Kubernetes secret: {secret_name} {'(exists)' if secret_exists else '(not found)'}
 
-WARNING: This operation will drop the role from PostgreSQL.
+WARNING: If the managed role entry exists, this operation will drop the role from PostgreSQL.
 Any objects owned by this role or permissions granted to it will be affected.
 
 To proceed with deletion, call delete_postgres_role again with dry_run=False (or omit the dry_run parameter).
 """
+
+        if role_index is None:
+            secret_deleted = await delete_role_secret(namespace, secret_name)
+            if secret_deleted:
+                return f"""Cleaned up orphaned PostgreSQL role secret for '{role_name}' in cluster '{namespace}/{cluster_name}'.
+
+The role was not present in .spec.managed.roles, so no cluster patch was needed.
+Deleted orphaned secret: {secret_name}
+"""
+            return f"Error: Role '{role_name}' not found in cluster '{namespace}/{cluster_name}', and associated secret '{secret_name}' was not found."
 
         # Remove the role from the list
         managed_roles.pop(role_index)
@@ -1852,19 +2048,7 @@ To proceed with deletion, call delete_postgres_role again with dry_run=False (or
         )
 
         # Delete the associated secret
-        secret_name = f"cnpg-{cluster_name}-user-{role_name}"
-        _, core_api = get_kubernetes_clients()
-
-        try:
-            await asyncio.to_thread(
-                core_api.delete_namespaced_secret,
-                name=secret_name,
-                namespace=namespace
-            )
-            secret_deleted = True
-        except ApiException:
-            # Secret doesn't exist or already deleted
-            secret_deleted = False
+        secret_deleted = await delete_role_secret(namespace, secret_name)
 
         secret_msg = f"\nAssociated secret '{secret_name}' was also deleted." if secret_deleted else ""
 
@@ -1941,6 +2125,9 @@ async def list_postgres_databases(
                     "ensure": spec.get('ensure', 'present'),
                     "reclaim_policy": spec.get('databaseReclaimPolicy', 'retain')
                 }
+                for field in DATABASE_CREATE_OPTION_LABELS:
+                    if field in spec:
+                        db_data[field] = spec[field]
                 database_list.append(db_data)
 
             return json.dumps({
@@ -1966,12 +2153,79 @@ async def list_postgres_databases(
             result += f"  - Owner: {owner}\n"
             result += f"  - Ensure: {ensure}\n"
             result += f"  - Reclaim Policy: {reclaim_policy}\n"
+            for field, label in DATABASE_CREATE_OPTION_LABELS.items():
+                if field in spec:
+                    result += f"  - {label}: {spec[field]}\n"
             result += "\n"
 
         return result
 
     except Exception as e:
         return format_error_message(e, f"listing databases for cluster {namespace}/{cluster_name}")
+
+
+@with_mcp_context
+async def get_postgres_database_status(
+    context: MCPContext,
+    cluster_name: str,
+    database_name: str,
+    namespace: Optional[str] = None,
+    format: Literal["text", "json"] = "text"
+) -> str:
+    """
+    Get the current Database CRD status and configured create-time options.
+
+    Args:
+        cluster_name: Name of the PostgreSQL cluster.
+        database_name: Name of the database inside PostgreSQL.
+        namespace: Kubernetes namespace where the cluster exists.
+        format: Output format. 'text' for human-readable (default), 'json' for structured
+               data that can be programmatically consumed.
+
+    Returns:
+        Database CRD metadata, current spec values for encoding/collation/locale options,
+        and operator reconciliation status.
+    """
+    try:
+        if namespace is None:
+            namespace = get_current_namespace()
+
+        database = await get_cnpg_database(namespace, cluster_name, database_name)
+        metadata = database.get("metadata", {})
+        spec = database.get("spec", {})
+        status = database.get("status", {})
+
+        if format == "json":
+            return json.dumps({
+                "cluster": f"{namespace}/{cluster_name}",
+                "crd_name": metadata.get("name", "unknown"),
+                "database_name": spec.get("name", database_name),
+                "owner": spec.get("owner", "unknown"),
+                "ensure": spec.get("ensure", "present"),
+                "reclaim_policy": spec.get("databaseReclaimPolicy", "retain"),
+                "generation": metadata.get("generation"),
+                "resource_version": metadata.get("resourceVersion"),
+                "create_options": database_create_options_dict(spec, include_unset=True),
+                "status": status,
+            }, indent=2)
+
+        result = f"**Database: {namespace}/{metadata.get('name', 'unknown')}**\n"
+        result += f"- PostgreSQL Database Name: {spec.get('name', database_name)}\n"
+        result += f"- Cluster: {namespace}/{cluster_name}\n"
+        result += f"- Owner: {spec.get('owner', 'unknown')}\n"
+        result += f"- Ensure: {spec.get('ensure', 'present')}\n"
+        result += f"- Reclaim Policy: {spec.get('databaseReclaimPolicy', 'retain')}\n"
+        result += f"- Generation: {metadata.get('generation', 'unknown')}\n"
+        result += f"- Resource Version: {metadata.get('resourceVersion', 'unknown')}\n"
+        result += "\nCurrent Locale/Encoding Values:\n"
+        result += format_database_create_options(spec, include_unset=True)
+        result += "\n\nOperator Status:\n"
+        result += format_database_object_status(status)
+        result += "\n"
+        return result
+
+    except Exception as e:
+        return format_error_message(e, f"getting database status for {namespace}/{cluster_name}/{database_name}")
 
 
 
@@ -1982,6 +2236,15 @@ async def create_postgres_database(
     database_name: str,
     owner: str,
     reclaim_policy: Literal["retain", "delete"] = "retain",
+    encoding: Optional[str] = None,
+    locale: Optional[str] = None,
+    locale_provider: Optional[Literal["builtin", "icu", "libc"]] = None,
+    locale_collate: Optional[str] = None,
+    locale_ctype: Optional[str] = None,
+    icu_locale: Optional[str] = None,
+    icu_rules: Optional[str] = None,
+    builtin_locale: Optional[str] = None,
+    collation_version: Optional[str] = None,
     namespace: Optional[str] = None,
     dry_run: bool = False
 ) -> str:
@@ -1995,6 +2258,15 @@ async def create_postgres_database(
         database_name: Name of the database to create.
         owner: Name of the role that will own the database.
         reclaim_policy: 'retain' to keep database after CRD deletion, 'delete' to remove it.
+        encoding: Optional CREATE DATABASE ENCODING value, for example UTF8.
+        locale: Optional CREATE DATABASE LOCALE value.
+        locale_provider: Optional CREATE DATABASE LOCALE_PROVIDER value: builtin, icu, or libc.
+        locale_collate: Optional CREATE DATABASE LC_COLLATE value.
+        locale_ctype: Optional CREATE DATABASE LC_CTYPE value.
+        icu_locale: Optional CREATE DATABASE ICU_LOCALE value. Requires locale_provider='icu'.
+        icu_rules: Optional CREATE DATABASE ICU_RULES value. Requires locale_provider='icu'.
+        builtin_locale: Optional CREATE DATABASE BUILTIN_LOCALE value. Requires locale_provider='builtin'.
+        collation_version: Optional CREATE DATABASE COLLATION_VERSION value.
         namespace: Kubernetes namespace.
         dry_run: If True, shows the Database CRD definition that would be created without
                 creating it. Useful for previewing the configuration. Default is False.
@@ -2015,6 +2287,12 @@ async def create_postgres_database(
 
         # Validate the resulting CRD name also conforms to RFC 1123
         validate_rfc1123_name(crd_name, "Database CRD")
+
+        if (icu_locale or icu_rules) and locale_provider != "icu":
+            return "Error: icu_locale and icu_rules require locale_provider='icu'."
+
+        if builtin_locale and locale_provider != "builtin":
+            return "Error: builtin_locale requires locale_provider='builtin'."
 
         # Build the Database CRD
         database_crd = {
@@ -2039,6 +2317,23 @@ async def create_postgres_database(
             }
         }
 
+        optional_database_fields = {
+            "encoding": encoding,
+            "locale": locale,
+            "localeProvider": locale_provider,
+            "localeCollate": locale_collate,
+            "localeCType": locale_ctype,
+            "icuLocale": icu_locale,
+            "icuRules": icu_rules,
+            "builtinLocale": builtin_locale,
+            "collationVersion": collation_version,
+        }
+        for field, value in optional_database_fields.items():
+            if value is not None:
+                database_crd["spec"][field] = value
+
+        database_options = format_database_create_options(database_crd["spec"])
+
         # If dry_run, return the Database CRD definition
         if dry_run:
             database_yaml = yaml.dump(database_crd, default_flow_style=False, sort_keys=False)
@@ -2054,6 +2349,9 @@ Database Details:
 - Owner: {owner}
 - Reclaim Policy: {reclaim_policy}
 - CRD Name: {crd_name}
+
+Database Locale/Encoding Options:
+{database_options}
 
 Reclaim Policy Behavior:
 - retain: Database will be kept in PostgreSQL even if the CRD is deleted
@@ -2080,6 +2378,9 @@ Database Details:
 - Owner: {owner}
 - Reclaim Policy: {reclaim_policy}
 - CRD Name: {crd_name}
+
+Database Locale/Encoding Options:
+{database_options}
 
 The CloudNativePG operator will create this database in the cluster.
 
@@ -2229,6 +2530,7 @@ def register_resources(mcp):
             "update_postgres_role",
             "delete_postgres_role",
             "list_postgres_databases",
+            "get_postgres_database_status",
             "create_postgres_database",
             "delete_postgres_database",
         ]
@@ -2507,13 +2809,39 @@ def register_tools(mcp):
             format=format,
         )
 
+    @mcp.tool(name="get_postgres_database_status")
+    async def get_postgres_database_status_tool(
+        cluster_name: str,
+        database_name: str,
+        namespace: Optional[str] = None,
+        format: Literal["text", "json"] = "text",
+        ctx: Context = None,
+    ) -> str:
+        """Get a CloudNativePG Database CRD's current spec values and reconciliation status."""
+        return await get_postgres_database_status(
+            context=ctx,
+            cluster_name=cluster_name,
+            database_name=database_name,
+            namespace=namespace,
+            format=format,
+        )
+
     @mcp.tool(name="create_postgres_database")
     async def create_postgres_database_tool(
         cluster_name: str,
         database_name: str,
         owner: str,
         reclaim_policy: Literal["retain", "delete"] = "retain",
-        namespace: str = None,
+        encoding: Optional[str] = None,
+        locale: Optional[str] = None,
+        locale_provider: Optional[Literal["builtin", "icu", "libc"]] = None,
+        locale_collate: Optional[str] = None,
+        locale_ctype: Optional[str] = None,
+        icu_locale: Optional[str] = None,
+        icu_rules: Optional[str] = None,
+        builtin_locale: Optional[str] = None,
+        collation_version: Optional[str] = None,
+        namespace: Optional[str] = None,
         dry_run: bool = False,
         ctx: Context = None,
     ) -> str:
@@ -2524,6 +2852,15 @@ def register_tools(mcp):
             database_name=database_name,
             owner=owner,
             reclaim_policy=reclaim_policy,
+            encoding=encoding,
+            locale=locale,
+            locale_provider=locale_provider,
+            locale_collate=locale_collate,
+            locale_ctype=locale_ctype,
+            icu_locale=icu_locale,
+            icu_rules=icu_rules,
+            builtin_locale=builtin_locale,
+            collation_version=collation_version,
             namespace=namespace,
             dry_run=dry_run,
         )
