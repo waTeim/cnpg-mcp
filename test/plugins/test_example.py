@@ -25,6 +25,7 @@ class TestCreatePostgresClusterDryRun(TestPlugin):
                     "instances": 1,
                     "storage_size": "1Gi",
                     "postgres_version": "16",
+                    "container_image": "registry.example.com/postgresql:16.4",
                     "dry_run": True,
                 },
             )
@@ -35,6 +36,7 @@ class TestCreatePostgresClusterDryRun(TestPlugin):
                 "kind: Cluster",
                 "name: dry-run-db",
                 "namespace: default",
+                "imageName: registry.example.com/postgresql:16.4",
             ]
             missing = [needle for needle in expected if needle not in text]
             if missing:

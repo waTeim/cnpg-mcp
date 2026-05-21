@@ -600,6 +600,11 @@ class CreateClusterInput(BaseModel):
         description="PostgreSQL major version to use.",
         examples=["14", "15", "16"]
     )
+    container_image: Optional[str] = Field(
+        None,
+        description="Full PostgreSQL container image reference to use for spec.imageName. If specified, overrides postgres_version.",
+        examples=["ghcr.io/cloudnative-pg/postgresql:16", "registry.example.com/postgres:16.4"]
+    )
     storage_class: Optional[str] = Field(
         None,
         description="Kubernetes storage class to use. If not specified, uses the cluster default."
@@ -1027,6 +1032,7 @@ async def create_postgres_cluster(
     instances: int = 3,
     storage_size: str = "10Gi",
     postgres_version: str = "16",
+    container_image: Optional[str] = None,
     storage_class: Optional[str] = None,
     wait: bool = False,
     timeout: Optional[int] = None,
@@ -1052,6 +1058,9 @@ async def create_postgres_cluster(
                      growth projections.
         postgres_version: PostgreSQL major version (e.g., '14', '15', '16').
                          CloudNativePG will use the latest minor version available.
+        container_image: Full PostgreSQL container image reference to use for
+                        spec.imageName (e.g., 'ghcr.io/cloudnative-pg/postgresql:16').
+                        If specified, overrides postgres_version.
         storage_class: Kubernetes storage class for persistent volumes. If not specified,
                       uses the cluster's default storage class. Use fast storage (SSD)
                       for production databases.
@@ -1078,6 +1087,10 @@ async def create_postgres_cluster(
         - Wait for ready (auto-timeout 3min for 3 instances): create_postgres_cluster(name="my-db", wait=True)
         - With custom timeout: create_postgres_cluster(name="my-db", wait=True, timeout=300)
         - Large cluster (wait auto-disabled): create_postgres_cluster(name="big-db", instances=8, wait=True)
+        - Custom image: create_postgres_cluster(
+            name="custom-db",
+            container_image="registry.example.com/postgresql:16.4"
+          )
         - Production cluster: create_postgres_cluster(
             name="main-db",
             instances=5,
@@ -1108,6 +1121,8 @@ async def create_postgres_cluster(
         if namespace is None:
             namespace = get_current_namespace()
 
+        cluster_image = container_image or f"ghcr.io/cloudnative-pg/postgresql:{postgres_version}"
+
         # Auto-disable wait for large clusters (> 5 instances)
         # Waiting more than 5 minutes is too long
         original_wait = wait
@@ -1131,7 +1146,7 @@ async def create_postgres_cluster(
             },
             "spec": {
                 "instances": instances,
-                "imageName": f"ghcr.io/cloudnative-pg/postgresql:{postgres_version}",
+                "imageName": cluster_image,
                 "storage": {
                     "size": storage_size
                 },
@@ -1184,7 +1199,7 @@ To create this cluster, call create_postgres_cluster again with dry_run=False (o
 
 Configuration:
 - Instances: {instances}
-- PostgreSQL Version: {postgres_version}
+- Container Image: {cluster_image}
 - Storage Size: {storage_size}
 {f'- Storage Class: {storage_class}' if storage_class else ''}{auto_disabled_msg}
 The cluster is now being provisioned. You can monitor its status using:
@@ -1207,7 +1222,7 @@ Wait until the cluster reaches 'Cluster in healthy state' phase before connectin
 
 Configuration:
 - Instances: {instances}
-- PostgreSQL Version: {postgres_version}
+- Container Image: {cluster_image}
 - Storage Size: {storage_size}
 {f'- Storage Class: {storage_class}' if storage_class else ''}
 
@@ -1234,7 +1249,7 @@ and PostgreSQL initialization time.
 
 Configuration:
 - Instances: {instances} ({ready_instances} ready)
-- PostgreSQL Version: {postgres_version}
+- Container Image: {cluster_image}
 - Storage Size: {storage_size}
 {f'- Storage Class: {storage_class}' if storage_class else ''}
 - Current Primary: {current_primary}
@@ -2647,6 +2662,7 @@ def register_tools(mcp):
         instances: int = 3,
         storage_size: str = "10Gi",
         postgres_version: str = "16",
+        container_image: str = None,
         storage_class: str = None,
         wait: bool = False,
         timeout: int = None,
@@ -2661,6 +2677,7 @@ def register_tools(mcp):
             instances=instances,
             storage_size=storage_size,
             postgres_version=postgres_version,
+            container_image=container_image,
             storage_class=storage_class,
             wait=wait,
             timeout=timeout,

@@ -31,6 +31,9 @@ locale options, including `encoding`, `locale`, `locale_provider`,
 `builtin_locale`, and `collation_version`.
 `get_postgres_database_status` reports the current Database CRD spec values for
 those options along with the operator reconciliation status.
+`create_postgres_cluster` accepts `container_image` to set the CloudNativePG
+`spec.imageName` directly; when omitted it continues to derive the image from
+`postgres_version`.
 
 It also includes MCP Base scaffold admin tools for prompt management:
 
