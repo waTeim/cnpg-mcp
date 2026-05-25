@@ -609,6 +609,11 @@ class CreateClusterInput(BaseModel):
         None,
         description="Kubernetes storage class to use. If not specified, uses the cluster default."
     )
+    image_pull_policy: Optional[str] = Field(
+        None,
+        description="Image pull policy for the PostgreSQL container (Always, Never, IfNotPresent). If not specified, Kubernetes default applies.",
+        examples=["Always", "Never", "IfNotPresent"]
+    )
     wait: bool = Field(
         False,
         description="Wait for the cluster to become operational before returning. If False, returns immediately after creation. Automatically set to False if instances > 5."
@@ -1034,6 +1039,7 @@ async def create_postgres_cluster(
     postgres_version: str = "16",
     container_image: Optional[str] = None,
     storage_class: Optional[str] = None,
+    image_pull_policy: Optional[str] = None,
     wait: bool = False,
     timeout: Optional[int] = None,
     namespace: Optional[str] = None,
@@ -1064,6 +1070,10 @@ async def create_postgres_cluster(
         storage_class: Kubernetes storage class for persistent volumes. If not specified,
                       uses the cluster's default storage class. Use fast storage (SSD)
                       for production databases.
+        image_pull_policy: Image pull policy for the PostgreSQL container image. Accepts
+                          standard Kubernetes values: 'Always', 'Never', or 'IfNotPresent'.
+                          If not specified, Kubernetes default behavior applies (IfNotPresent
+                          for tagged images, Always for :latest).
         wait: If True, wait for the cluster to become operational before returning.
               If False (default), return immediately after creation. Automatically
               set to False if instances > 5 (to avoid waiting more than 5 minutes).
@@ -1163,6 +1173,10 @@ async def create_postgres_cluster(
         if storage_class:
             cluster_spec["spec"]["storage"]["storageClass"] = storage_class
 
+        # Add image pull policy if specified
+        if image_pull_policy:
+            cluster_spec["spec"]["imagePullPolicy"] = image_pull_policy
+
         # If dry_run, return the cluster definition without creating
         if dry_run:
             cluster_yaml = yaml.dump(cluster_spec, default_flow_style=False, sort_keys=False)
@@ -1201,7 +1215,7 @@ Configuration:
 - Instances: {instances}
 - Container Image: {cluster_image}
 - Storage Size: {storage_size}
-{f'- Storage Class: {storage_class}' if storage_class else ''}{auto_disabled_msg}
+{f'- Storage Class: {storage_class}' if storage_class else ''}{f'- Image Pull Policy: {image_pull_policy}' if image_pull_policy else ''}{auto_disabled_msg}
 The cluster is now being provisioned. You can monitor its status using:
 get_cluster_status(namespace="{namespace}", name="{cluster_name}")
 
@@ -1224,7 +1238,7 @@ Configuration:
 - Instances: {instances}
 - Container Image: {cluster_image}
 - Storage Size: {storage_size}
-{f'- Storage Class: {storage_class}' if storage_class else ''}
+{f'- Storage Class: {storage_class}' if storage_class else ''}{f'- Image Pull Policy: {image_pull_policy}' if image_pull_policy else ''}
 
 Timeout: {timeout} seconds elapsed
 
@@ -1251,7 +1265,7 @@ Configuration:
 - Instances: {instances} ({ready_instances} ready)
 - Container Image: {cluster_image}
 - Storage Size: {storage_size}
-{f'- Storage Class: {storage_class}' if storage_class else ''}
+{f'- Storage Class: {storage_class}' if storage_class else ''}{f'- Image Pull Policy: {image_pull_policy}' if image_pull_policy else ''}
 - Current Primary: {current_primary}
 
 Status: {phase}
@@ -2664,6 +2678,7 @@ def register_tools(mcp):
         postgres_version: str = "16",
         container_image: str = None,
         storage_class: str = None,
+        image_pull_policy: str = None,
         wait: bool = False,
         timeout: int = None,
         namespace: str = None,
@@ -2679,6 +2694,7 @@ def register_tools(mcp):
             postgres_version=postgres_version,
             container_image=container_image,
             storage_class=storage_class,
+            image_pull_policy=image_pull_policy,
             wait=wait,
             timeout=timeout,
             namespace=namespace,
