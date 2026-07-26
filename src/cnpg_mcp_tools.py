@@ -600,9 +600,29 @@ class CreateClusterInput(BaseModel):
         description="PostgreSQL major version to use.",
         examples=["14", "15", "16"]
     )
+    container_image: Optional[str] = Field(
+        None,
+        description="Full PostgreSQL container image reference to use for spec.imageName. If specified, overrides postgres_version.",
+        examples=["ghcr.io/cloudnative-pg/postgresql:16", "registry.example.com/postgres:16.4"]
+    )
     storage_class: Optional[str] = Field(
         None,
         description="Kubernetes storage class to use. If not specified, uses the cluster default."
+    )
+    image_pull_policy: Optional[str] = Field(
+        None,
+        description="Image pull policy for the PostgreSQL container (Always, Never, IfNotPresent). If not specified, Kubernetes default applies.",
+        examples=["Always", "Never", "IfNotPresent"]
+    )
+    node_selector: Optional[Dict[str, str]] = Field(
+        None,
+        description="Node labels used to constrain scheduling (spec.affinity.nodeSelector). Required for node-local storage: pin instances to the node(s) holding the local volumes and pair with a node-local storage_class.",
+        examples=[{"kubernetes.io/hostname": "worker-1"}, {"disktype": "nvme"}]
+    )
+    tolerations: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description="Pod tolerations allowing scheduling onto tainted nodes (spec.affinity.tolerations). Dedicated local-storage nodes are often tainted; supply matching tolerations so pods are admitted. Each entry uses standard fields: key, operator, value, effect, tolerationSeconds.",
+        examples=[[{"key": "storage", "operator": "Equal", "value": "local", "effect": "NoSchedule"}]]
     )
     wait: bool = Field(
         False,
@@ -1027,7 +1047,11 @@ async def create_postgres_cluster(
     instances: int = 3,
     storage_size: str = "10Gi",
     postgres_version: str = "16",
+    container_image: Optional[str] = None,
     storage_class: Optional[str] = None,
+    image_pull_policy: Optional[str] = None,
+    node_selector: Optional[Dict[str, str]] = None,
+    tolerations: Optional[List[Dict[str, Any]]] = None,
     wait: bool = False,
     timeout: Optional[int] = None,
     namespace: Optional[str] = None,
@@ -1052,9 +1076,33 @@ async def create_postgres_cluster(
                      growth projections.
         postgres_version: PostgreSQL major version (e.g., '14', '15', '16').
                          CloudNativePG will use the latest minor version available.
+        container_image: Full PostgreSQL container image reference to use for
+                        spec.imageName (e.g., 'ghcr.io/cloudnative-pg/postgresql:16').
+                        If specified, overrides postgres_version.
         storage_class: Kubernetes storage class for persistent volumes. If not specified,
                       uses the cluster's default storage class. Use fast storage (SSD)
                       for production databases.
+        image_pull_policy: Image pull policy for the PostgreSQL container image. Accepts
+                          standard Kubernetes values: 'Always', 'Never', or 'IfNotPresent'.
+                          If not specified, Kubernetes default behavior applies (IfNotPresent
+                          for tagged images, Always for :latest).
+        node_selector: Node labels (as a key/value map) used to constrain which nodes the
+                      cluster pods can be scheduled onto. Maps to spec.affinity.nodeSelector.
+                      Essential when using node-local storage: pin instances to the node(s)
+                      that physically hold the local volumes, e.g.
+                      {"kubernetes.io/hostname": "worker-1"} to pin to a specific node, or
+                      {"disktype": "nvme"} to target a pool of nodes with local SSDs. Pair
+                      this with a node-local storage_class (e.g. a topology-aware local
+                      volume provisioner) so the PersistentVolumes are provisioned on the
+                      same nodes the pods land on.
+        tolerations: Pod tolerations (as a list of Kubernetes Toleration objects) allowing
+                    the cluster pods to schedule onto tainted nodes. Maps to
+                    spec.affinity.tolerations. Dedicated local-storage nodes are commonly
+                    tainted; supply matching tolerations so the pods are actually admitted,
+                    e.g. [{"key": "storage", "operator": "Equal", "value": "local",
+                    "effect": "NoSchedule"}]. Each entry accepts the standard toleration
+                    fields: key, operator ('Equal' or 'Exists'), value, effect
+                    ('NoSchedule', 'PreferNoSchedule', 'NoExecute'), and tolerationSeconds.
         wait: If True, wait for the cluster to become operational before returning.
               If False (default), return immediately after creation. Automatically
               set to False if instances > 5 (to avoid waiting more than 5 minutes).
@@ -1078,6 +1126,10 @@ async def create_postgres_cluster(
         - Wait for ready (auto-timeout 3min for 3 instances): create_postgres_cluster(name="my-db", wait=True)
         - With custom timeout: create_postgres_cluster(name="my-db", wait=True, timeout=300)
         - Large cluster (wait auto-disabled): create_postgres_cluster(name="big-db", instances=8, wait=True)
+        - Custom image: create_postgres_cluster(
+            name="custom-db",
+            container_image="registry.example.com/postgresql:16.4"
+          )
         - Production cluster: create_postgres_cluster(
             name="main-db",
             instances=5,
@@ -1086,6 +1138,22 @@ async def create_postgres_cluster(
             storage_class="fast-ssd",
             wait=True,
             namespace="production"
+          )
+        - Node-local storage pinned to a node: create_postgres_cluster(
+            name="local-db",
+            instances=1,
+            storage_size="500Gi",
+            storage_class="local-storage",
+            node_selector={"kubernetes.io/hostname": "worker-1"}
+          )
+        - Node-local storage on a dedicated (tainted) storage pool: create_postgres_cluster(
+            name="local-ha-db",
+            instances=3,
+            storage_size="500Gi",
+            storage_class="local-storage",
+            node_selector={"disktype": "nvme"},
+            tolerations=[{"key": "storage", "operator": "Equal",
+                          "value": "local", "effect": "NoSchedule"}]
           )
 
     Error Handling:
@@ -1107,6 +1175,8 @@ async def create_postgres_cluster(
         # Infer namespace from context if not provided
         if namespace is None:
             namespace = get_current_namespace()
+
+        cluster_image = container_image or f"ghcr.io/cloudnative-pg/postgresql:{postgres_version}"
 
         # Auto-disable wait for large clusters (> 5 instances)
         # Waiting more than 5 minutes is too long
@@ -1131,7 +1201,7 @@ async def create_postgres_cluster(
             },
             "spec": {
                 "instances": instances,
-                "imageName": f"ghcr.io/cloudnative-pg/postgresql:{postgres_version}",
+                "imageName": cluster_image,
                 "storage": {
                     "size": storage_size
                 },
@@ -1147,6 +1217,33 @@ async def create_postgres_cluster(
         # Add storage class if specified
         if storage_class:
             cluster_spec["spec"]["storage"]["storageClass"] = storage_class
+
+        # Add image pull policy if specified
+        if image_pull_policy:
+            cluster_spec["spec"]["imagePullPolicy"] = image_pull_policy
+
+        # Add pod scheduling constraints if specified. CNPG exposes these under
+        # spec.affinity: nodeSelector pins pods to nodes matching the given labels
+        # (required to co-locate pods with node-local storage), and tolerations allow
+        # those pods onto tainted (e.g. dedicated storage) nodes.
+        affinity: Dict[str, Any] = {}
+        if node_selector:
+            affinity["nodeSelector"] = node_selector
+        if tolerations:
+            affinity["tolerations"] = tolerations
+        if affinity:
+            cluster_spec["spec"]["affinity"] = affinity
+
+        # Pre-rendered display lines for optional settings (used in status messages).
+        storage_class_line = f"- Storage Class: {storage_class}\n" if storage_class else ""
+        pull_policy_line = f"- Image Pull Policy: {image_pull_policy}\n" if image_pull_policy else ""
+        node_selector_line = (
+            f"- Node Selector: {', '.join(f'{k}={v}' for k, v in node_selector.items())}\n"
+            if node_selector else ""
+        )
+        tolerations_line = (
+            f"- Tolerations: {len(tolerations)} configured\n" if tolerations else ""
+        )
 
         # If dry_run, return the cluster definition without creating
         if dry_run:
@@ -1184,9 +1281,9 @@ To create this cluster, call create_postgres_cluster again with dry_run=False (o
 
 Configuration:
 - Instances: {instances}
-- PostgreSQL Version: {postgres_version}
+- Container Image: {cluster_image}
 - Storage Size: {storage_size}
-{f'- Storage Class: {storage_class}' if storage_class else ''}{auto_disabled_msg}
+{storage_class_line}{pull_policy_line}{node_selector_line}{tolerations_line}{auto_disabled_msg}
 The cluster is now being provisioned. You can monitor its status using:
 get_cluster_status(namespace="{namespace}", name="{cluster_name}")
 
@@ -1207,10 +1304,9 @@ Wait until the cluster reaches 'Cluster in healthy state' phase before connectin
 
 Configuration:
 - Instances: {instances}
-- PostgreSQL Version: {postgres_version}
+- Container Image: {cluster_image}
 - Storage Size: {storage_size}
-{f'- Storage Class: {storage_class}' if storage_class else ''}
-
+{storage_class_line}{pull_policy_line}{node_selector_line}{tolerations_line}
 Timeout: {timeout} seconds elapsed
 
 The cluster is still provisioning. Check status with:
@@ -1234,10 +1330,9 @@ and PostgreSQL initialization time.
 
 Configuration:
 - Instances: {instances} ({ready_instances} ready)
-- PostgreSQL Version: {postgres_version}
+- Container Image: {cluster_image}
 - Storage Size: {storage_size}
-{f'- Storage Class: {storage_class}' if storage_class else ''}
-- Current Primary: {current_primary}
+{storage_class_line}{pull_policy_line}{node_selector_line}{tolerations_line}- Current Primary: {current_primary}
 
 Status: {phase}
 
@@ -2647,7 +2742,11 @@ def register_tools(mcp):
         instances: int = 3,
         storage_size: str = "10Gi",
         postgres_version: str = "16",
+        container_image: str = None,
         storage_class: str = None,
+        image_pull_policy: str = None,
+        node_selector: Dict[str, str] = None,
+        tolerations: List[Dict[str, Any]] = None,
         wait: bool = False,
         timeout: int = None,
         namespace: str = None,
@@ -2661,7 +2760,11 @@ def register_tools(mcp):
             instances=instances,
             storage_size=storage_size,
             postgres_version=postgres_version,
+            container_image=container_image,
             storage_class=storage_class,
+            image_pull_policy=image_pull_policy,
+            node_selector=node_selector,
+            tolerations=tolerations,
             wait=wait,
             timeout=timeout,
             namespace=namespace,
