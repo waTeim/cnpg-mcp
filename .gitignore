@@ -12,6 +12,7 @@ token.txt
 tmp
 results.json
 Chart.lock
+.devcontainer/devcontainer-lock.json
 
 # OS generated files #
 ######################
