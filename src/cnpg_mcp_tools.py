@@ -614,6 +614,16 @@ class CreateClusterInput(BaseModel):
         description="Image pull policy for the PostgreSQL container (Always, Never, IfNotPresent). If not specified, Kubernetes default applies.",
         examples=["Always", "Never", "IfNotPresent"]
     )
+    node_selector: Optional[Dict[str, str]] = Field(
+        None,
+        description="Node labels used to constrain scheduling (spec.affinity.nodeSelector). Required for node-local storage: pin instances to the node(s) holding the local volumes and pair with a node-local storage_class.",
+        examples=[{"kubernetes.io/hostname": "worker-1"}, {"disktype": "nvme"}]
+    )
+    tolerations: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description="Pod tolerations allowing scheduling onto tainted nodes (spec.affinity.tolerations). Dedicated local-storage nodes are often tainted; supply matching tolerations so pods are admitted. Each entry uses standard fields: key, operator, value, effect, tolerationSeconds.",
+        examples=[[{"key": "storage", "operator": "Equal", "value": "local", "effect": "NoSchedule"}]]
+    )
     wait: bool = Field(
         False,
         description="Wait for the cluster to become operational before returning. If False, returns immediately after creation. Automatically set to False if instances > 5."
@@ -1040,6 +1050,8 @@ async def create_postgres_cluster(
     container_image: Optional[str] = None,
     storage_class: Optional[str] = None,
     image_pull_policy: Optional[str] = None,
+    node_selector: Optional[Dict[str, str]] = None,
+    tolerations: Optional[List[Dict[str, Any]]] = None,
     wait: bool = False,
     timeout: Optional[int] = None,
     namespace: Optional[str] = None,
@@ -1074,6 +1086,23 @@ async def create_postgres_cluster(
                           standard Kubernetes values: 'Always', 'Never', or 'IfNotPresent'.
                           If not specified, Kubernetes default behavior applies (IfNotPresent
                           for tagged images, Always for :latest).
+        node_selector: Node labels (as a key/value map) used to constrain which nodes the
+                      cluster pods can be scheduled onto. Maps to spec.affinity.nodeSelector.
+                      Essential when using node-local storage: pin instances to the node(s)
+                      that physically hold the local volumes, e.g.
+                      {"kubernetes.io/hostname": "worker-1"} to pin to a specific node, or
+                      {"disktype": "nvme"} to target a pool of nodes with local SSDs. Pair
+                      this with a node-local storage_class (e.g. a topology-aware local
+                      volume provisioner) so the PersistentVolumes are provisioned on the
+                      same nodes the pods land on.
+        tolerations: Pod tolerations (as a list of Kubernetes Toleration objects) allowing
+                    the cluster pods to schedule onto tainted nodes. Maps to
+                    spec.affinity.tolerations. Dedicated local-storage nodes are commonly
+                    tainted; supply matching tolerations so the pods are actually admitted,
+                    e.g. [{"key": "storage", "operator": "Equal", "value": "local",
+                    "effect": "NoSchedule"}]. Each entry accepts the standard toleration
+                    fields: key, operator ('Equal' or 'Exists'), value, effect
+                    ('NoSchedule', 'PreferNoSchedule', 'NoExecute'), and tolerationSeconds.
         wait: If True, wait for the cluster to become operational before returning.
               If False (default), return immediately after creation. Automatically
               set to False if instances > 5 (to avoid waiting more than 5 minutes).
@@ -1109,6 +1138,22 @@ async def create_postgres_cluster(
             storage_class="fast-ssd",
             wait=True,
             namespace="production"
+          )
+        - Node-local storage pinned to a node: create_postgres_cluster(
+            name="local-db",
+            instances=1,
+            storage_size="500Gi",
+            storage_class="local-storage",
+            node_selector={"kubernetes.io/hostname": "worker-1"}
+          )
+        - Node-local storage on a dedicated (tainted) storage pool: create_postgres_cluster(
+            name="local-ha-db",
+            instances=3,
+            storage_size="500Gi",
+            storage_class="local-storage",
+            node_selector={"disktype": "nvme"},
+            tolerations=[{"key": "storage", "operator": "Equal",
+                          "value": "local", "effect": "NoSchedule"}]
           )
 
     Error Handling:
@@ -1177,6 +1222,29 @@ async def create_postgres_cluster(
         if image_pull_policy:
             cluster_spec["spec"]["imagePullPolicy"] = image_pull_policy
 
+        # Add pod scheduling constraints if specified. CNPG exposes these under
+        # spec.affinity: nodeSelector pins pods to nodes matching the given labels
+        # (required to co-locate pods with node-local storage), and tolerations allow
+        # those pods onto tainted (e.g. dedicated storage) nodes.
+        affinity: Dict[str, Any] = {}
+        if node_selector:
+            affinity["nodeSelector"] = node_selector
+        if tolerations:
+            affinity["tolerations"] = tolerations
+        if affinity:
+            cluster_spec["spec"]["affinity"] = affinity
+
+        # Pre-rendered display lines for optional settings (used in status messages).
+        storage_class_line = f"- Storage Class: {storage_class}\n" if storage_class else ""
+        pull_policy_line = f"- Image Pull Policy: {image_pull_policy}\n" if image_pull_policy else ""
+        node_selector_line = (
+            f"- Node Selector: {', '.join(f'{k}={v}' for k, v in node_selector.items())}\n"
+            if node_selector else ""
+        )
+        tolerations_line = (
+            f"- Tolerations: {len(tolerations)} configured\n" if tolerations else ""
+        )
+
         # If dry_run, return the cluster definition without creating
         if dry_run:
             cluster_yaml = yaml.dump(cluster_spec, default_flow_style=False, sort_keys=False)
@@ -1215,7 +1283,7 @@ Configuration:
 - Instances: {instances}
 - Container Image: {cluster_image}
 - Storage Size: {storage_size}
-{f'- Storage Class: {storage_class}' if storage_class else ''}{f'- Image Pull Policy: {image_pull_policy}' if image_pull_policy else ''}{auto_disabled_msg}
+{storage_class_line}{pull_policy_line}{node_selector_line}{tolerations_line}{auto_disabled_msg}
 The cluster is now being provisioned. You can monitor its status using:
 get_cluster_status(namespace="{namespace}", name="{cluster_name}")
 
@@ -1238,8 +1306,7 @@ Configuration:
 - Instances: {instances}
 - Container Image: {cluster_image}
 - Storage Size: {storage_size}
-{f'- Storage Class: {storage_class}' if storage_class else ''}{f'- Image Pull Policy: {image_pull_policy}' if image_pull_policy else ''}
-
+{storage_class_line}{pull_policy_line}{node_selector_line}{tolerations_line}
 Timeout: {timeout} seconds elapsed
 
 The cluster is still provisioning. Check status with:
@@ -1265,8 +1332,7 @@ Configuration:
 - Instances: {instances} ({ready_instances} ready)
 - Container Image: {cluster_image}
 - Storage Size: {storage_size}
-{f'- Storage Class: {storage_class}' if storage_class else ''}{f'- Image Pull Policy: {image_pull_policy}' if image_pull_policy else ''}
-- Current Primary: {current_primary}
+{storage_class_line}{pull_policy_line}{node_selector_line}{tolerations_line}- Current Primary: {current_primary}
 
 Status: {phase}
 
@@ -2679,6 +2745,8 @@ def register_tools(mcp):
         container_image: str = None,
         storage_class: str = None,
         image_pull_policy: str = None,
+        node_selector: Dict[str, str] = None,
+        tolerations: List[Dict[str, Any]] = None,
         wait: bool = False,
         timeout: int = None,
         namespace: str = None,
@@ -2695,6 +2763,8 @@ def register_tools(mcp):
             container_image=container_image,
             storage_class=storage_class,
             image_pull_policy=image_pull_policy,
+            node_selector=node_selector,
+            tolerations=tolerations,
             wait=wait,
             timeout=timeout,
             namespace=namespace,

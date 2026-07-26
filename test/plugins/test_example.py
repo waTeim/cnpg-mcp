@@ -129,6 +129,105 @@ class TestCreatePostgresClusterDryRun(TestPlugin):
             )
 
 
+class TestCreatePostgresClusterAffinityDryRun(TestPlugin):
+    """Calls create_postgres_cluster in dry-run mode with node affinity options."""
+
+    tool_name = "create_postgres_cluster"
+    description = "Verifies create_postgres_cluster renders spec.affinity nodeSelector and tolerations"
+    depends_on = ["TestCnpgToolSurface"]
+    run_after = ["TestCreatePostgresClusterDryRun"]
+
+    async def test(self, session) -> TestResult:
+        start_time = time.time()
+
+        try:
+            properties = await _tool_input_properties(session, self.tool_name)
+            missing_params = [p for p in ("node_selector", "tolerations") if p not in properties]
+            if missing_params:
+                return TestResult(
+                    plugin_name=self.get_name(),
+                    tool_name=self.tool_name,
+                    passed=False,
+                    message="create_postgres_cluster server schema is missing affinity params",
+                    error=(
+                        f"missing {missing_params} from create_postgres_cluster_tool "
+                        "signature. Rebuild/restart the server from "
+                        "src/cnpg_mcp_tools.py before running this test."
+                    ),
+                    duration_ms=(time.time() - start_time) * 1000,
+                )
+
+            result = await session.call_tool(
+                self.tool_name,
+                arguments={
+                    "name": "affinity-dry-run-db",
+                    "namespace": "default",
+                    "instances": 1,
+                    "storage_size": "1Gi",
+                    "storage_class": "local-storage",
+                    "node_selector": {"kubernetes.io/hostname": "worker-1"},
+                    "tolerations": [
+                        {
+                            "key": "storage",
+                            "operator": "Equal",
+                            "value": "local",
+                            "effect": "NoSchedule",
+                        }
+                    ],
+                    "dry_run": True,
+                },
+            )
+            text = _content_text(result)
+            manifest = _yaml_from_response(text)
+
+            spec = manifest.get("spec", {})
+            affinity = spec.get("affinity", {})
+            errors = []
+
+            if spec.get("storage", {}).get("storageClass") != "local-storage":
+                errors.append("spec.storage.storageClass != local-storage")
+            if affinity.get("nodeSelector") != {"kubernetes.io/hostname": "worker-1"}:
+                errors.append(f"unexpected nodeSelector: {affinity.get('nodeSelector')}")
+            tolerations = affinity.get("tolerations")
+            if tolerations != [
+                {
+                    "key": "storage",
+                    "operator": "Equal",
+                    "value": "local",
+                    "effect": "NoSchedule",
+                }
+            ]:
+                errors.append(f"unexpected tolerations: {tolerations}")
+
+            if errors:
+                return TestResult(
+                    plugin_name=self.get_name(),
+                    tool_name=self.tool_name,
+                    passed=False,
+                    message="Dry-run manifest did not include expected affinity/storage values",
+                    error="; ".join(errors) + f"; response={text[:500]}",
+                    duration_ms=(time.time() - start_time) * 1000,
+                )
+
+            return TestResult(
+                plugin_name=self.get_name(),
+                tool_name=self.tool_name,
+                passed=True,
+                message="create_postgres_cluster dry-run rendered affinity nodeSelector and tolerations",
+                duration_ms=(time.time() - start_time) * 1000,
+            )
+
+        except Exception as e:
+            return TestResult(
+                plugin_name=self.get_name(),
+                tool_name=self.tool_name,
+                passed=False,
+                message="create_postgres_cluster affinity dry-run call raised",
+                error=str(e),
+                duration_ms=(time.time() - start_time) * 1000,
+            )
+
+
 class TestCreatePostgresDatabaseLocaleDryRun(TestPlugin):
     """Calls create_postgres_database in dry-run mode with locale options."""
 
