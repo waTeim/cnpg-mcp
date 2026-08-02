@@ -186,7 +186,8 @@ oidc:
 
 # Operator RBAC Configuration
 # The chart creates namespaced permissions for CloudNativePG clusters,
-# Database CRDs, and role/database secrets in the release namespace by default.
+# Database and DatabaseRole CRDs, and role/database secrets in the release
+# namespace by default.
 rbac:
   # Additional namespaces where the MCP deployment service account can manage
   # CloudNativePG resources. The service account remains in the release

@@ -2,7 +2,7 @@
 cnpg-mcp MCP Server - CloudNativePG Tool Implementations
 
 This module contains the MCP tool implementations for managing CloudNativePG
-clusters, declarative PostgreSQL roles, and Database CRDs. The Kubernetes
+clusters, DatabaseRole CRDs, and Database CRDs. The Kubernetes
 business logic is adapted from deprecated-v1/src/cnpg_tools.py and registered
 through the MCP Base scaffold registration hooks.
 """
@@ -94,6 +94,19 @@ CNPG_GROUP = "postgresql.cnpg.io"
 CNPG_VERSION = "v1"
 CNPG_PLURAL = "clusters"
 CNPG_DATABASE_PLURAL = "databases"
+CNPG_DATABASE_ROLE_PLURAL = "databaseroles"
+
+# Boolean DatabaseRole attributes, mapped to their display label and the value
+# PostgreSQL assumes when the field is left unset in the CRD.
+DATABASE_ROLE_FLAGS = {
+    "login": ("Login", False),
+    "superuser": ("Superuser", False),
+    "inherit": ("Inherit", True),
+    "createdb": ("Create DB", False),
+    "createrole": ("Create Role", False),
+    "replication": ("Replication", False),
+    "bypassrls": ("Bypass RLS", False),
+}
 
 DATABASE_CREATE_OPTION_LABELS = {
     "encoding": "Encoding",
@@ -464,6 +477,170 @@ async def get_cnpg_database(namespace: str, cluster_name: str, database_name: st
     return matches[0]
 
 
+def database_role_crd_name(cluster_name: str, role_name: str) -> str:
+    """Return the conventional DatabaseRole CRD name for a cluster/role pair."""
+    return f"{cluster_name}-{role_name}"
+
+
+def role_password_secret_name(cluster_name: str, role_name: str) -> str:
+    """Return the conventional password Secret name for a cluster/role pair."""
+    return f"cnpg-{cluster_name}-user-{role_name}"
+
+
+async def list_cnpg_database_roles(namespace: str, cluster_name: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List DatabaseRole CRDs in a namespace, optionally filtered by cluster."""
+    try:
+        custom_api, _ = get_kubernetes_clients()
+        result = await asyncio.to_thread(
+            custom_api.list_namespaced_custom_object,
+            group=CNPG_GROUP,
+            version=CNPG_VERSION,
+            namespace=namespace,
+            plural=CNPG_DATABASE_ROLE_PLURAL,
+        )
+    except ApiException as e:
+        raise Exception(format_error_message(e, f"listing database roles in namespace {namespace}"))
+
+    roles = result.get("items", [])
+    if cluster_name is None:
+        return roles
+    return [
+        role for role in roles
+        if role.get("spec", {}).get("cluster", {}).get("name") == cluster_name
+    ]
+
+
+async def get_cnpg_database_role(namespace: str, cluster_name: str, role_name: str) -> Dict[str, Any]:
+    """
+    Get a DatabaseRole CRD by PostgreSQL role name.
+
+    The create/delete tools use <cluster>-<role> as the CRD name, but users can
+    create DatabaseRole CRDs with custom metadata names. Try the conventional
+    name first, then fall back to matching spec.cluster.name and spec.name.
+    """
+    custom_api, _ = get_kubernetes_clients()
+    expected_crd_name = database_role_crd_name(cluster_name, role_name)
+
+    try:
+        role = await asyncio.to_thread(
+            custom_api.get_namespaced_custom_object,
+            group=CNPG_GROUP,
+            version=CNPG_VERSION,
+            namespace=namespace,
+            plural=CNPG_DATABASE_ROLE_PLURAL,
+            name=expected_crd_name,
+        )
+        spec = role.get("spec", {})
+        if spec.get("cluster", {}).get("name") == cluster_name and spec.get("name") == role_name:
+            return role
+    except ApiException as e:
+        if e.status != 404:
+            raise Exception(format_error_message(e, f"getting database role {namespace}/{expected_crd_name}"))
+
+    matches = [
+        role for role in await list_cnpg_database_roles(namespace, cluster_name)
+        if role.get("spec", {}).get("name") == role_name
+    ]
+    if not matches:
+        raise Exception(f"DatabaseRole CRD for role '{role_name}' in cluster '{namespace}/{cluster_name}' was not found.")
+    if len(matches) > 1:
+        names = ", ".join(role.get("metadata", {}).get("name", "unknown") for role in matches)
+        raise Exception(f"Multiple DatabaseRole CRDs match role '{role_name}' in cluster '{namespace}/{cluster_name}': {names}")
+    return matches[0]
+
+
+async def find_cnpg_database_role(namespace: str, cluster_name: str, role_name: str) -> Optional[Dict[str, Any]]:
+    """Return a DatabaseRole CRD, or None when no CRD matches the role name."""
+    try:
+        return await get_cnpg_database_role(namespace, cluster_name, role_name)
+    except Exception as e:
+        if "was not found" in str(e):
+            return None
+        raise
+
+
+async def patch_cnpg_database_role_spec(namespace: str, crd_name: str, spec_patch: Dict[str, Any]) -> Dict[str, Any]:
+    """Patch selected DatabaseRole spec fields with a focused merge patch."""
+    try:
+        custom_api, _ = get_kubernetes_clients()
+        return await asyncio.to_thread(
+            custom_api.patch_namespaced_custom_object,
+            group=CNPG_GROUP,
+            version=CNPG_VERSION,
+            namespace=namespace,
+            plural=CNPG_DATABASE_ROLE_PLURAL,
+            name=crd_name,
+            body={"spec": spec_patch},
+        )
+    except ApiException as e:
+        raise Exception(format_error_message(e, f"patching database role {namespace}/{crd_name}"))
+
+
+def database_role_attributes_dict(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Return DatabaseRole attributes as a structured dict, with defaults applied."""
+    attributes: Dict[str, Any] = {
+        field: spec.get(field, default) for field, (_, default) in DATABASE_ROLE_FLAGS.items()
+    }
+    attributes.update({
+        "connection_limit": spec.get("connectionLimit", -1),
+        "valid_until": spec.get("validUntil"),
+        "comment": spec.get("comment"),
+        "in_roles": spec.get("inRoles", []),
+        "disable_password": spec.get("disablePassword", False),
+        "client_certificate": spec.get("clientCertificate", {}).get("enabled", False),
+        "password_secret": spec.get("passwordSecret", {}).get("name"),
+    })
+    return attributes
+
+
+def format_database_role_attributes(spec: Dict[str, Any]) -> str:
+    """Format DatabaseRole attributes in a human-readable way."""
+    lines = [f"- {label}: {spec.get(field, default)}" for field, (label, default) in DATABASE_ROLE_FLAGS.items()]
+    lines.append(f"- Connection Limit: {spec.get('connectionLimit', -1)}")
+
+    if spec.get("validUntil"):
+        lines.append(f"- Valid Until: {spec['validUntil']}")
+    if spec.get("comment"):
+        lines.append(f"- Comment: {spec['comment']}")
+    if spec.get("inRoles"):
+        lines.append(f"- Member of: {', '.join(spec['inRoles'])}")
+    if spec.get("disablePassword"):
+        lines.append("- Password: disabled (set to NULL in PostgreSQL)")
+    else:
+        lines.append(f"- Password Secret: {spec.get('passwordSecret', {}).get('name', 'none')}")
+    if spec.get("clientCertificate", {}).get("enabled"):
+        lines.append("- Client Certificate: enabled")
+
+    return "\n".join(lines)
+
+
+def format_database_role_object_status(status: Dict[str, Any]) -> str:
+    """Format DatabaseRole CRD reconciliation status."""
+    if not status:
+        return "- Status: not reported by the operator yet"
+
+    lines = [
+        f"- Applied: {status.get('applied', 'unknown')}",
+        f"- Observed Generation: {status.get('observedGeneration', 'unknown')}",
+        f"- Message: {status.get('message', 'none')}",
+    ]
+
+    client_certificate = status.get("clientCertificate") or {}
+    if client_certificate:
+        lines.append(
+            f"- Client Certificate: expiration={client_certificate.get('expiration', 'unknown')}, "
+            f"message={client_certificate.get('message', 'none')}"
+        )
+
+    for condition in status.get("conditions") or []:
+        lines.append(
+            f"- Condition {condition.get('type', 'unknown')}: {condition.get('status', 'unknown')} "
+            f"({condition.get('reason', 'unknown')}: {condition.get('message', 'none')})"
+        )
+
+    return "\n".join(lines)
+
+
 async def read_role_secret(namespace: str, secret_name: str) -> Optional[Any]:
     """Read a role password Secret, returning None when it does not exist."""
     _, core_api = get_kubernetes_clients()
@@ -493,6 +670,58 @@ async def delete_role_secret(namespace: str, secret_name: str) -> bool:
         if e.status == 404:
             return False
         raise
+
+
+async def write_role_secret(
+    namespace: str,
+    secret_name: str,
+    cluster_name: str,
+    role_name: str,
+    password: str,
+) -> bool:
+    """
+    Store a role password in a basic-auth Secret, creating it when absent.
+
+    Returns True when a new Secret was created, False when an existing one was
+    updated in place.
+    """
+    _, core_api = get_kubernetes_clients()
+
+    existing = await read_role_secret(namespace, secret_name)
+    if existing is not None:
+        existing.data = dict(existing.data or {})
+        existing.data["username"] = base64.b64encode(role_name.encode()).decode()
+        existing.data["password"] = base64.b64encode(password.encode()).decode()
+        await asyncio.to_thread(
+            core_api.replace_namespaced_secret,
+            name=secret_name,
+            namespace=namespace,
+            body=existing,
+        )
+        return False
+
+    secret = client.V1Secret(
+        metadata=client.V1ObjectMeta(
+            name=secret_name,
+            namespace=namespace,
+            labels={
+                "app.kubernetes.io/name": "cnpg",
+                "cnpg.io/cluster": cluster_name,
+                "cnpg.io/role": role_name,
+            },
+        ),
+        data={
+            "username": base64.b64encode(role_name.encode()).decode(),
+            "password": base64.b64encode(password.encode()).decode(),
+        },
+        type="kubernetes.io/basic-auth",
+    )
+    await asyncio.to_thread(
+        core_api.create_namespaced_secret,
+        namespace=namespace,
+        body=secret,
+    )
+    return True
 
 
 def format_cluster_status(cluster: Dict[str, Any], detail_level: str = "concise") -> str:
@@ -694,12 +923,22 @@ class ListRolesInput(BaseModel):
     )
 
 
+class GetRoleStatusInput(BaseModel):
+    """Input for getting PostgreSQL role status."""
+    cluster_name: str = Field(..., description="Name of the PostgreSQL cluster.")
+    role_name: str = Field(..., description="Name of the role inside PostgreSQL.")
+    namespace: Optional[str] = Field(
+        None,
+        description="Kubernetes namespace where the cluster exists. If not specified, uses the current namespace from your Kubernetes context."
+    )
+
+
 class CreateRoleInput(BaseModel):
     """Input for creating a PostgreSQL role."""
     cluster_name: str = Field(..., description="Name of the PostgreSQL cluster.")
     role_name: str = Field(
         ...,
-        description="Name of the role to create. Must conform to RFC 1123 DNS label standard (required for Kubernetes secret naming): lowercase letters (a-z), numbers (0-9), and hyphens (-) only; must start and end with a letter or number; max 63 characters.",
+        description="Name of the role to create. Must conform to RFC 1123 DNS label standard (required for DatabaseRole CRD and Kubernetes secret naming): lowercase letters (a-z), numbers (0-9), and hyphens (-) only; must start and end with a letter or number; max 63 characters.",
         examples=["app-user", "readonly-user", "admin-01"],
         pattern=r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$',
         max_length=63
@@ -710,13 +949,39 @@ class CreateRoleInput(BaseModel):
     createdb: bool = Field(False, description="Allow role to create databases. Default: false.")
     createrole: bool = Field(False, description="Allow role to create other roles. Default: false.")
     replication: bool = Field(False, description="Allow role to initiate streaming replication. Default: false.")
+    bypassrls: bool = Field(False, description="Allow role to bypass row-level security policies. Default: false.")
+    in_roles: Optional[List[str]] = Field(
+        None,
+        description="Existing roles this role is granted membership in, for example ['pg_read_all_data']."
+    )
+    connection_limit: Optional[int] = Field(
+        None,
+        description="Maximum concurrent connections for this role. -1 (the default) means no limit."
+    )
+    valid_until: Optional[str] = Field(
+        None,
+        description="RFC 3339 timestamp after which the role's password is no longer valid, for example '2026-12-31T23:59:59Z'. Omit for a password that never expires."
+    )
+    comment: Optional[str] = Field(None, description="Description attached to the role in PostgreSQL.")
+    disable_password: bool = Field(
+        False,
+        description="If True, the role's password is set to NULL and no password Secret is generated. Default: false."
+    )
+    client_certificate: bool = Field(
+        False,
+        description="If True, the operator issues and renews a TLS client certificate for this role in Secret '<cluster>-<role>-client-cert'. Requires login=True. Default: false."
+    )
+    reclaim_policy: Literal["retain", "delete"] = Field(
+        "retain",
+        description="Policy for role deletion. 'retain' keeps the role in PostgreSQL when the DatabaseRole CRD is deleted, 'delete' drops it."
+    )
     namespace: Optional[str] = Field(
         None,
         description="Kubernetes namespace where the cluster exists. If not specified, uses the current namespace from your Kubernetes context."
     )
     dry_run: bool = Field(
         False,
-        description="If True, shows the role definition that would be created without creating it. Useful for previewing the configuration."
+        description="If True, shows the DatabaseRole CRD that would be created without creating it. Useful for previewing the configuration."
     )
 
 
@@ -730,6 +995,20 @@ class UpdateRoleInput(BaseModel):
     createdb: Optional[bool] = Field(None, description="Allow role to create databases.")
     createrole: Optional[bool] = Field(None, description="Allow role to create other roles.")
     replication: Optional[bool] = Field(None, description="Allow role to initiate streaming replication.")
+    bypassrls: Optional[bool] = Field(None, description="Allow role to bypass row-level security policies.")
+    in_roles: Optional[List[str]] = Field(
+        None,
+        description="Replacement list of roles this role is a member of. Membership changes are applied with GRANT/REVOKE."
+    )
+    connection_limit: Optional[int] = Field(None, description="Maximum concurrent connections for this role. -1 means no limit.")
+    valid_until: Optional[str] = Field(None, description="RFC 3339 timestamp after which the role's password is no longer valid.")
+    comment: Optional[str] = Field(None, description="Description attached to the role in PostgreSQL.")
+    disable_password: Optional[bool] = Field(None, description="Set the role's password to NULL in PostgreSQL.")
+    client_certificate: Optional[bool] = Field(None, description="Issue and renew a TLS client certificate for this role. Requires login.")
+    reclaim_policy: Optional[Literal["retain", "delete"]] = Field(
+        None,
+        description="Policy for role deletion. 'retain' keeps the role in PostgreSQL when the DatabaseRole CRD is deleted, 'delete' drops it."
+    )
     password: Optional[str] = Field(None, description="New password for the role. If not specified, password remains unchanged.")
     namespace: Optional[str] = Field(
         None,
@@ -745,6 +1024,10 @@ class DeleteRoleInput(BaseModel):
     """Input for deleting a PostgreSQL role."""
     cluster_name: str = Field(..., description="Name of the PostgreSQL cluster.")
     role_name: str = Field(..., description="Name of the role to delete.")
+    drop_role: bool = Field(
+        False,
+        description="If True, forces the DatabaseRole reclaim policy to 'delete' before removing the CRD, so the role is dropped from PostgreSQL. If False, the reclaim policy configured on the role decides."
+    )
     namespace: Optional[str] = Field(
         None,
         description="Kubernetes namespace where the cluster exists. If not specified, uses the current namespace from your Kubernetes context."
@@ -1026,7 +1309,9 @@ async def get_cluster_status(
                     "storage_class": spec.get('storage', {}).get('storageClass'),
                     "conditions": status.get('conditions', []),
                     "postgresql_parameters": spec.get('postgresql', {}).get('parameters', {}),
-                    "managed_roles": spec.get('managed', {}).get('roles', [])
+                    # Roles are managed through DatabaseRole CRDs; this reports only
+                    # leftovers in the deprecated inline Cluster field.
+                    "legacy_managed_roles": spec.get('managed', {}).get('roles', [])
                 })
 
             return json.dumps(cluster_data, indent=2)
@@ -1631,9 +1916,10 @@ async def list_postgres_roles(
     format: Literal["text", "json"] = "text"
 ) -> str:
     """
-    List all PostgreSQL roles/users managed in a cluster.
+    List all PostgreSQL roles/users managed for a cluster by DatabaseRole CRDs.
 
-    Reads roles from the Cluster CRD's .spec.managed.roles field.
+    Roles defined through the deprecated Cluster .spec.managed.roles field are
+    reported separately so pre-existing roles stay visible.
 
     Args:
         cluster_name: Name of the PostgreSQL cluster.
@@ -1649,75 +1935,134 @@ async def list_postgres_roles(
         if namespace is None:
             namespace = get_current_namespace()
 
-        # Get the cluster to read managed roles
+        # Verify the cluster exists and pick up any legacy inline role definitions
         cluster = await get_cnpg_cluster(namespace, cluster_name)
-        managed_roles = cluster.get('spec', {}).get('managed', {}).get('roles', [])
+        legacy_roles = cluster.get('spec', {}).get('managed', {}).get('roles', [])
 
-        if not managed_roles:
-            if format == "json":
-                return json.dumps({
-                    "cluster": f"{namespace}/{cluster_name}",
-                    "roles": [],
-                    "count": 0
-                })
-            return f"No managed roles defined in cluster '{namespace}/{cluster_name}'.\n\nRoles are managed through the Cluster CRD's .spec.managed.roles field."
+        database_roles = await list_cnpg_database_roles(namespace, cluster_name)
 
         if format == "json":
-            # Return structured JSON
             role_list = []
-            for role in managed_roles:
+            for role in database_roles:
+                metadata = role.get('metadata', {})
+                spec = role.get('spec', {})
                 role_data = {
-                    "name": role.get('name', 'unknown'),
-                    "ensure": role.get('ensure', 'present'),
-                    "login": role.get('login', False),
-                    "superuser": role.get('superuser', False),
-                    "inherit": role.get('inherit', True),
-                    "createdb": role.get('createdb', False),
-                    "createrole": role.get('createrole', False),
-                    "replication": role.get('replication', False),
-                    "password_secret": role.get('passwordSecret', {}).get('name', 'none'),
-                    "in_roles": role.get('inRoles', [])
+                    "crd_name": metadata.get('name', 'unknown'),
+                    "name": spec.get('name', 'unknown'),
+                    "ensure": spec.get('ensure', 'present'),
+                    "reclaim_policy": spec.get('databaseRoleReclaimPolicy', 'retain'),
+                    "applied": role.get('status', {}).get('applied'),
                 }
+                role_data.update(database_role_attributes_dict(spec))
                 role_list.append(role_data)
 
             return json.dumps({
                 "cluster": f"{namespace}/{cluster_name}",
                 "roles": role_list,
-                "count": len(role_list)
+                "count": len(role_list),
+                "legacy_managed_roles": [r.get('name', 'unknown') for r in legacy_roles],
             }, indent=2)
 
-        # Default: human-readable text
-        result = f"PostgreSQL Roles managed in cluster '{namespace}/{cluster_name}':\n\n"
+        if not database_roles and not legacy_roles:
+            return (
+                f"No roles defined for cluster '{namespace}/{cluster_name}'.\n\n"
+                "Roles are managed through DatabaseRole CRDs. Create one with create_postgres_role."
+            )
 
-        for role in managed_roles:
-            name = role.get('name', 'unknown')
-            ensure = role.get('ensure', 'present')
-            login = role.get('login', False)
-            superuser = role.get('superuser', False)
-            inherit = role.get('inherit', True)
-            createdb = role.get('createdb', False)
-            createrole = role.get('createrole', False)
-            replication = role.get('replication', False)
-            password_secret = role.get('passwordSecret', {}).get('name', 'none')
-            in_roles = role.get('inRoles', [])
+        result = f"PostgreSQL Roles for cluster '{namespace}/{cluster_name}':\n\n"
 
-            result += f"**{name}**\n"
-            result += f"  - Ensure: {ensure}\n"
-            result += f"  - Login: {login}\n"
-            result += f"  - Superuser: {superuser}\n"
-            result += f"  - Inherit: {inherit}\n"
-            result += f"  - Create DB: {createdb}\n"
-            result += f"  - Create Role: {createrole}\n"
-            result += f"  - Replication: {replication}\n"
-            result += f"  - Password Secret: {password_secret}\n"
-            if in_roles:
-                result += f"  - Member of: {', '.join(in_roles)}\n"
+        for role in database_roles:
+            metadata = role.get('metadata', {})
+            spec = role.get('spec', {})
+            status = role.get('status', {})
+
+            result += f"**{spec.get('name', 'unknown')}**\n"
+            result += f"  - DatabaseRole CRD: {metadata.get('name', 'unknown')}\n"
+            result += f"  - Ensure: {spec.get('ensure', 'present')}\n"
+            result += f"  - Reclaim Policy: {spec.get('databaseRoleReclaimPolicy', 'retain')}\n"
+            result += f"  - Applied: {status.get('applied', 'not reported yet')}\n"
+            result += "".join(f"  {line}\n" for line in format_database_role_attributes(spec).splitlines())
+            result += "\n"
+
+        if not database_roles:
+            result += "No DatabaseRole CRDs found.\n\n"
+
+        if legacy_roles:
+            result += (
+                "Legacy roles in the deprecated Cluster .spec.managed.roles field "
+                "(not managed by this server):\n"
+            )
+            for role in legacy_roles:
+                result += f"  - {role.get('name', 'unknown')} (ensure: {role.get('ensure', 'present')})\n"
             result += "\n"
 
         return result
 
     except Exception as e:
         return format_error_message(e, f"listing roles in cluster {namespace}/{cluster_name}")
+
+
+
+@with_mcp_context
+async def get_postgres_role_status(
+    context: MCPContext,
+    cluster_name: str,
+    role_name: str,
+    namespace: Optional[str] = None,
+    format: Literal["text", "json"] = "text"
+) -> str:
+    """
+    Get the current DatabaseRole CRD spec and operator reconciliation status.
+
+    Args:
+        cluster_name: Name of the PostgreSQL cluster.
+        role_name: Name of the role inside PostgreSQL.
+        namespace: Kubernetes namespace where the cluster exists.
+        format: Output format. 'text' for human-readable (default), 'json' for structured
+               data that can be programmatically consumed.
+
+    Returns:
+        DatabaseRole CRD metadata, current attribute values, and operator
+        reconciliation status.
+    """
+    try:
+        if namespace is None:
+            namespace = get_current_namespace()
+
+        role = await get_cnpg_database_role(namespace, cluster_name, role_name)
+        metadata = role.get("metadata", {})
+        spec = role.get("spec", {})
+        status = role.get("status", {})
+
+        if format == "json":
+            return json.dumps({
+                "cluster": f"{namespace}/{cluster_name}",
+                "crd_name": metadata.get("name", "unknown"),
+                "role_name": spec.get("name", role_name),
+                "ensure": spec.get("ensure", "present"),
+                "reclaim_policy": spec.get("databaseRoleReclaimPolicy", "retain"),
+                "generation": metadata.get("generation"),
+                "resource_version": metadata.get("resourceVersion"),
+                "attributes": database_role_attributes_dict(spec),
+                "status": status,
+            }, indent=2)
+
+        result = f"**Role: {namespace}/{metadata.get('name', 'unknown')}**\n"
+        result += f"- PostgreSQL Role Name: {spec.get('name', role_name)}\n"
+        result += f"- Cluster: {namespace}/{cluster_name}\n"
+        result += f"- Ensure: {spec.get('ensure', 'present')}\n"
+        result += f"- Reclaim Policy: {spec.get('databaseRoleReclaimPolicy', 'retain')}\n"
+        result += f"- Generation: {metadata.get('generation', 'unknown')}\n"
+        result += f"- Resource Version: {metadata.get('resourceVersion', 'unknown')}\n"
+        result += "\nRole Attributes:\n"
+        result += format_database_role_attributes(spec)
+        result += "\n\nOperator Status:\n"
+        result += format_database_role_object_status(status)
+        result += "\n"
+        return result
+
+    except Exception as e:
+        return format_error_message(e, f"getting role status for {namespace}/{cluster_name}/{role_name}")
 
 
 
@@ -1732,14 +2077,23 @@ async def create_postgres_role(
     createdb: bool = False,
     createrole: bool = False,
     replication: bool = False,
+    bypassrls: bool = False,
+    in_roles: Optional[List[str]] = None,
+    connection_limit: Optional[int] = None,
+    valid_until: Optional[str] = None,
+    comment: Optional[str] = None,
+    disable_password: bool = False,
+    client_certificate: bool = False,
+    reclaim_policy: Literal["retain", "delete"] = "retain",
     namespace: Optional[str] = None,
     dry_run: bool = False
 ) -> str:
     """
-    Create a new PostgreSQL role/user in a cluster using CloudNativePG's declarative role management.
+    Create a new PostgreSQL role/user using CloudNativePG's DatabaseRole CRD.
 
-    Automatically generates a secure password and stores it in a Kubernetes secret.
-    Adds the role to the Cluster CRD's .spec.managed.roles field.
+    Creates a DatabaseRole custom resource that the CloudNativePG operator will
+    reconcile. Unless disable_password is set, a secure password is generated and
+    stored in a Kubernetes Secret referenced by the CRD.
 
     Args:
         cluster_name: Name of the PostgreSQL cluster.
@@ -1750,169 +2104,196 @@ async def create_postgres_role(
         createdb: Allow creating databases (default: false).
         createrole: Allow creating roles (default: false).
         replication: Allow streaming replication (default: false).
+        bypassrls: Allow bypassing row-level security (default: false).
+        in_roles: Existing roles this role is granted membership in.
+        connection_limit: Maximum concurrent connections, -1 for no limit.
+        valid_until: RFC 3339 timestamp after which the password expires.
+        comment: Description attached to the role in PostgreSQL.
+        disable_password: If True, sets the password to NULL and skips Secret creation.
+        client_certificate: If True, the operator issues a TLS client certificate for the role.
+        reclaim_policy: 'retain' to keep the role after CRD deletion, 'delete' to drop it.
         namespace: Kubernetes namespace.
-        dry_run: If True, shows the role definition that would be created without
+        dry_run: If True, shows the DatabaseRole CRD that would be created without
                 creating it. Useful for previewing the configuration. Default is False.
 
     Returns:
         Success message with password retrieval instructions.
-        If dry_run=True, returns a preview of the role definition.
+        If dry_run=True, returns a preview of the DatabaseRole CRD.
     """
     try:
-        # Validate role name conforms to RFC 1123 (required for Kubernetes secret naming)
+        # Validate role name conforms to RFC 1123 (required for CRD and secret naming)
         validate_rfc1123_name(role_name, "Role")
 
         if namespace is None:
             namespace = get_current_namespace()
 
-        # Get the cluster to verify it exists and check for existing role
+        crd_name = database_role_crd_name(cluster_name, role_name)
+        validate_rfc1123_name(crd_name, "DatabaseRole CRD")
+
+        if client_certificate and not login:
+            return "Error: client_certificate requires login=True."
+
+        secret_name = None
+        if not disable_password:
+            secret_name = role_password_secret_name(cluster_name, role_name)
+            validate_rfc1123_name(secret_name, "Role secret")
+
+        # Verify the cluster exists and check for a conflicting role definition
         cluster = await get_cnpg_cluster(namespace, cluster_name)
-        managed_roles = cluster.get('spec', {}).get('managed', {}).get('roles', [])
 
-        # Check if role already exists
-        existing_role = next((r for r in managed_roles if r.get('name') == role_name), None)
-        if existing_role:
-            return f"Error: Role '{role_name}' already exists in cluster '{namespace}/{cluster_name}'."
+        existing = await find_cnpg_database_role(namespace, cluster_name, role_name)
+        if existing is not None:
+            return (
+                f"Error: Role '{role_name}' already exists in cluster '{namespace}/{cluster_name}' "
+                f"(DatabaseRole CRD '{existing.get('metadata', {}).get('name', crd_name)}')."
+            )
 
-        # If dry_run, show what would be created
-        if dry_run:
-            secret_name = f"cnpg-{cluster_name}-user-{role_name}"
+        legacy_roles = cluster.get('spec', {}).get('managed', {}).get('roles', [])
+        if any(r.get('name') == role_name for r in legacy_roles):
+            return (
+                f"Error: Role '{role_name}' is already defined in the deprecated "
+                f".spec.managed.roles field of cluster '{namespace}/{cluster_name}'. "
+                "Remove it there before managing the role with a DatabaseRole CRD."
+            )
 
-            role_def = {
+        # Build the DatabaseRole CRD
+        role_crd = {
+            "apiVersion": f"{CNPG_GROUP}/{CNPG_VERSION}",
+            "kind": "DatabaseRole",
+            "metadata": {
+                "name": crd_name,
+                "namespace": namespace,
+                "labels": {
+                    "cnpg.io/cluster": cluster_name,
+                    "cnpg.io/role": role_name
+                }
+            },
+            "spec": {
                 "name": role_name,
+                "cluster": {
+                    "name": cluster_name
+                },
                 "ensure": "present",
+                "databaseRoleReclaimPolicy": reclaim_policy,
                 "login": login,
                 "superuser": superuser,
                 "inherit": inherit,
                 "createdb": createdb,
                 "createrole": createrole,
                 "replication": replication,
-                "passwordSecret": {
-                    "name": secret_name
-                }
+                "bypassrls": bypassrls
             }
+        }
 
-            role_yaml = yaml.dump(role_def, default_flow_style=False, sort_keys=False)
+        optional_role_fields = {
+            "inRoles": in_roles,
+            "connectionLimit": connection_limit,
+            "validUntil": valid_until,
+            "comment": comment,
+        }
+        for field, value in optional_role_fields.items():
+            if value is not None:
+                role_crd["spec"][field] = value
 
-            return f"""Dry run: PostgreSQL role definition for '{role_name}' in cluster '{namespace}/{cluster_name}'
+        if disable_password:
+            role_crd["spec"]["disablePassword"] = True
+        else:
+            role_crd["spec"]["passwordSecret"] = {"name": secret_name}
 
-Role definition that would be added to .spec.managed.roles:
+        if client_certificate:
+            role_crd["spec"]["clientCertificate"] = {"enabled": True}
+
+        role_attributes = format_database_role_attributes(role_crd["spec"])
+
+        # If dry_run, show what would be created
+        if dry_run:
+            role_yaml = yaml.dump(role_crd, default_flow_style=False, sort_keys=False)
+            secret_preview = (
+                "- Kubernetes secret: (none; disable_password=True)"
+                if disable_password
+                else f"""- Kubernetes secret: {secret_name}
+  - Contains auto-generated password (16 characters)
+  - Labeled with cnpg.io/cluster={cluster_name} and cnpg.io/role={role_name}"""
+            )
+
+            return f"""Dry run: DatabaseRole CRD definition for '{role_name}' in cluster '{namespace}/{cluster_name}'
+
+This is the DatabaseRole CRD that would be created:
 
 ```yaml
 {role_yaml}```
 
 Resources that would be created:
-- Kubernetes secret: {secret_name}
-  - Contains auto-generated password (16 characters)
-  - Labeled with cnpg.io/cluster={cluster_name} and cnpg.io/role={role_name}
+- DatabaseRole CRD: {crd_name}
+{secret_preview}
 
 Role Attributes:
-- Login: {login}
-- Superuser: {superuser}
-- Inherit: {inherit}
-- Create DB: {createdb}
-- Create Role: {createrole}
-- Replication: {replication}
+{role_attributes}
+
+Reclaim Policy Behavior:
+- retain: Role is kept in PostgreSQL even if the CRD is deleted
+- delete: Role is dropped from PostgreSQL when the CRD is deleted
 
 To create this role, call create_postgres_role again with dry_run=False (or omit the dry_run parameter).
 """
 
-        # Generate a secure password
-        password = generate_password(16)
+        # Store the generated password before the operator needs it
+        password = None
+        if not disable_password:
+            password = generate_password(16)
+            await write_role_secret(namespace, secret_name, cluster_name, role_name, password)
 
-        # Create Kubernetes secret to store the password
-        secret_name = f"cnpg-{cluster_name}-user-{role_name}"
-
-        # Validate the resulting secret name conforms to RFC 1123
-        validate_rfc1123_name(secret_name, "Role secret")
-
-        _, core_api = get_kubernetes_clients()
-
-        secret_data = {
-            "username": base64.b64encode(role_name.encode()).decode(),
-            "password": base64.b64encode(password.encode()).decode()
-        }
-
-        secret = client.V1Secret(
-            metadata=client.V1ObjectMeta(
-                name=secret_name,
-                namespace=namespace,
-                labels={
-                    "app.kubernetes.io/name": "cnpg",
-                    "cnpg.io/cluster": cluster_name,
-                    "cnpg.io/role": role_name
-                }
-            ),
-            data=secret_data,
-            type="kubernetes.io/basic-auth"
-        )
-
-        await asyncio.to_thread(
-            core_api.create_namespaced_secret,
-            namespace=namespace,
-            body=secret
-        )
-
-        # Ensure managed.roles exists
-        if 'managed' not in cluster['spec']:
-            cluster['spec']['managed'] = {}
-        if 'roles' not in cluster['spec']['managed']:
-            cluster['spec']['managed']['roles'] = []
-
-        # Add the new role
-        new_role = {
-            "name": role_name,
-            "ensure": "present",
-            "login": login,
-            "superuser": superuser,
-            "inherit": inherit,
-            "createdb": createdb,
-            "createrole": createrole,
-            "replication": replication,
-            "passwordSecret": {
-                "name": secret_name
-            }
-        }
-
-        cluster['spec']['managed']['roles'].append(new_role)
-
+        custom_api, _ = get_kubernetes_clients()
         try:
-            await patch_cnpg_cluster_spec(
-                namespace,
-                cluster_name,
-                {"managed": {"roles": cluster["spec"]["managed"]["roles"]}},
+            await asyncio.to_thread(
+                custom_api.create_namespaced_custom_object,
+                group=CNPG_GROUP,
+                version=CNPG_VERSION,
+                namespace=namespace,
+                plural=CNPG_DATABASE_ROLE_PLURAL,
+                body=role_crd
             )
         except Exception:
-            try:
-                await delete_role_secret(namespace, secret_name)
-            except Exception as cleanup_error:
-                logger.warning(
-                    "Failed to clean up role password secret %s/%s after cluster patch failed: %s",
-                    namespace,
-                    secret_name,
-                    cleanup_error,
-                )
+            if secret_name is not None:
+                try:
+                    await delete_role_secret(namespace, secret_name)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "Failed to clean up role password secret %s/%s after DatabaseRole creation failed: %s",
+                        namespace,
+                        secret_name,
+                        cleanup_error,
+                    )
             raise
 
-        return f"""Successfully created PostgreSQL role '{role_name}' in cluster '{namespace}/{cluster_name}'.
-
-Role Attributes:
-- Login: {login}
-- Superuser: {superuser}
-- Inherit: {inherit}
-- Create DB: {createdb}
-- Create Role: {createrole}
-- Replication: {replication}
-
-Password stored in Kubernetes secret: {secret_name}
+        if disable_password:
+            password_section = "Password: disabled (set to NULL in PostgreSQL)"
+        else:
+            password_section = f"""Password stored in Kubernetes secret: {secret_name}
 
 To retrieve the password:
 kubectl get secret {secret_name} -n {namespace} -o jsonpath='{{.data.password}}' | base64 -d
 
 Connection string:
-postgresql://{role_name}:<password>@{cluster_name}-rw.{namespace}.svc:5432/app
+postgresql://{role_name}:<password>@{cluster_name}-rw.{namespace}.svc:5432/app"""
+
+        certificate_section = (
+            f"\n\nClient certificate Secret: {crd_name}-client-cert (issued and renewed by the operator)"
+            if client_certificate else ""
+        )
+
+        return f"""Successfully created DatabaseRole CRD '{crd_name}' for role '{role_name}' in cluster '{namespace}/{cluster_name}'.
+
+Role Attributes:
+{role_attributes}
+- Reclaim Policy: {reclaim_policy}
+
+{password_section}{certificate_section}
 
 The CloudNativePG operator will reconcile this role in the database.
+
+To view the role status:
+kubectl get databaserole {crd_name} -n {namespace}
 """
 
     except Exception as e:
@@ -1931,17 +2312,33 @@ async def update_postgres_role(
     createdb: Optional[bool] = None,
     createrole: Optional[bool] = None,
     replication: Optional[bool] = None,
+    bypassrls: Optional[bool] = None,
+    in_roles: Optional[List[str]] = None,
+    connection_limit: Optional[int] = None,
+    valid_until: Optional[str] = None,
+    comment: Optional[str] = None,
+    disable_password: Optional[bool] = None,
+    client_certificate: Optional[bool] = None,
+    reclaim_policy: Optional[Literal["retain", "delete"]] = None,
     password: Optional[str] = None,
     namespace: Optional[str] = None,
     dry_run: bool = False
 ) -> str:
     """
-    Update attributes of an existing PostgreSQL role using CloudNativePG's declarative role management.
+    Update an existing PostgreSQL role by patching its DatabaseRole CRD.
 
     Args:
         cluster_name: Name of the PostgreSQL cluster.
         role_name: Name of the role to update.
-        login, superuser, inherit, createdb, createrole, replication: Optional attribute changes.
+        login, superuser, inherit, createdb, createrole, replication, bypassrls:
+            Optional attribute changes.
+        in_roles: Optional replacement list of role memberships.
+        connection_limit: Optional new concurrent connection limit.
+        valid_until: Optional new password expiry timestamp (RFC 3339).
+        comment: Optional new role description.
+        disable_password: Optional toggle for setting the password to NULL.
+        client_certificate: Optional toggle for operator-issued TLS client certificates.
+        reclaim_policy: Optional new end-of-life policy: 'retain' or 'delete'.
         password: Optional new password. If not provided, password remains unchanged.
         namespace: Kubernetes namespace.
         dry_run: If True, shows what changes would be made without applying them.
@@ -1955,54 +2352,88 @@ async def update_postgres_role(
         if namespace is None:
             namespace = get_current_namespace()
 
-        # Get the cluster
-        cluster = await get_cnpg_cluster(namespace, cluster_name)
-        managed_roles = cluster.get('spec', {}).get('managed', {}).get('roles', [])
+        role = await get_cnpg_database_role(namespace, cluster_name, role_name)
+        crd_name = role.get("metadata", {}).get("name")
+        spec = role.get("spec", {})
 
-        # Find the role
-        role = next((r for r in managed_roles if r.get('name') == role_name), None)
-        if not role:
-            return f"Error: Role '{role_name}' not found in cluster '{namespace}/{cluster_name}'."
+        spec_patch: Dict[str, Any] = {}
+        updates: List[str] = []
 
-        updates = []
+        flag_changes = {
+            "login": login,
+            "superuser": superuser,
+            "inherit": inherit,
+            "createdb": createdb,
+            "createrole": createrole,
+            "replication": replication,
+            "bypassrls": bypassrls,
+        }
+        for field, value in flag_changes.items():
+            if value is None:
+                continue
+            label, default = DATABASE_ROLE_FLAGS[field]
+            spec_patch[field] = value
+            updates.append(f"{label}: {spec.get(field, default)} -> {value}")
 
-        # Build list of proposed updates
-        if login is not None:
-            updates.append((f"Login: {role.get('login', False)} -> {login}", 'login', login))
+        if in_roles is not None:
+            spec_patch["inRoles"] = in_roles
+            current = spec.get("inRoles", [])
+            updates.append(f"Member of: {current or 'none'} -> {in_roles or 'none'}")
 
-        if superuser is not None:
-            updates.append((f"Superuser: {role.get('superuser', False)} -> {superuser}", 'superuser', superuser))
+        if connection_limit is not None:
+            spec_patch["connectionLimit"] = connection_limit
+            updates.append(f"Connection Limit: {spec.get('connectionLimit', -1)} -> {connection_limit}")
 
-        if inherit is not None:
-            updates.append((f"Inherit: {role.get('inherit', True)} -> {inherit}", 'inherit', inherit))
+        if valid_until is not None:
+            spec_patch["validUntil"] = valid_until
+            updates.append(f"Valid Until: {spec.get('validUntil', 'never')} -> {valid_until}")
 
-        if createdb is not None:
-            updates.append((f"Create DB: {role.get('createdb', False)} -> {createdb}", 'createdb', createdb))
+        if comment is not None:
+            spec_patch["comment"] = comment
+            updates.append(f"Comment: {spec.get('comment', 'none')} -> {comment}")
 
-        if createrole is not None:
-            updates.append((f"Create Role: {role.get('createrole', False)} -> {createrole}", 'createrole', createrole))
+        if client_certificate is not None:
+            if client_certificate and not spec_patch.get("login", spec.get("login", False)):
+                return "Error: client_certificate requires the role to have login enabled."
+            spec_patch["clientCertificate"] = {"enabled": client_certificate}
+            current = spec.get("clientCertificate", {}).get("enabled", False)
+            updates.append(f"Client Certificate: {current} -> {client_certificate}")
 
-        if replication is not None:
-            updates.append((f"Replication: {role.get('replication', False)} -> {replication}", 'replication', replication))
+        if reclaim_policy is not None:
+            spec_patch["databaseRoleReclaimPolicy"] = reclaim_policy
+            current = spec.get("databaseRoleReclaimPolicy", "retain")
+            updates.append(f"Reclaim Policy: {current} -> {reclaim_policy}")
+
+        if disable_password is not None:
+            spec_patch["disablePassword"] = disable_password
+            updates.append(f"Disable Password: {spec.get('disablePassword', False)} -> {disable_password}")
+
+        secret_name = spec.get("passwordSecret", {}).get("name") or role_password_secret_name(cluster_name, role_name)
 
         if password is not None:
-            updates.append(("Password: will be updated", 'password', password))
+            if disable_password:
+                return "Error: password cannot be set while disable_password=True."
+            validate_rfc1123_name(secret_name, "Role secret")
+            updates.append(f"Password: will be updated in Secret '{secret_name}'")
+            if spec.get("disablePassword") and disable_password is None:
+                spec_patch["disablePassword"] = False
+                updates.append("Disable Password: True -> False (implied by setting a password)")
+            if not spec.get("passwordSecret", {}).get("name"):
+                spec_patch["passwordSecret"] = {"name": secret_name}
+                updates.append(f"Password Secret: none -> {secret_name}")
 
         if not updates:
             return "No updates specified. Please provide at least one attribute to update."
 
-        # If dry_run, show what would change
         if dry_run:
-            update_text = '\n- '.join([u[0] for u in updates])
+            update_text = '\n- '.join(updates)
             return f"""Dry run: Update preview for role '{role_name}' in cluster '{namespace}/{cluster_name}'
 
+DatabaseRole CRD: {crd_name}
+
 Current attributes:
-- Login: {role.get('login', False)}
-- Superuser: {role.get('superuser', False)}
-- Inherit: {role.get('inherit', True)}
-- Create DB: {role.get('createdb', False)}
-- Create Role: {role.get('createrole', False)}
-- Replication: {role.get('replication', False)}
+{format_database_role_attributes(spec)}
+- Reclaim Policy: {spec.get('databaseRoleReclaimPolicy', 'retain')}
 
 Proposed changes:
 - {update_text}
@@ -2010,43 +2441,14 @@ Proposed changes:
 To apply these changes, call update_postgres_role again with dry_run=False (or omit the dry_run parameter).
 """
 
-        # Apply updates
-        simple_updates = []
-        for update_desc, attr_name, value in updates:
-            if attr_name == 'password':
-                # Update the secret
-                secret_name = f"cnpg-{cluster_name}-user-{role_name}"
-                _, core_api = get_kubernetes_clients()
+        if password is not None:
+            await write_role_secret(namespace, secret_name, cluster_name, role_name, password)
 
-                try:
-                    secret = await asyncio.to_thread(
-                        core_api.read_namespaced_secret,
-                        name=secret_name,
-                        namespace=namespace
-                    )
-                    secret.data["password"] = base64.b64encode(password.encode()).decode()
-                    await asyncio.to_thread(
-                        core_api.replace_namespaced_secret,
-                        name=secret_name,
-                        namespace=namespace,
-                        body=secret
-                    )
-                    simple_updates.append("Password: updated")
-                except ApiException as e:
-                    return f"Error: Secret '{secret_name}' not found. Cannot update password."
-            else:
-                # Update role attribute
-                role[attr_name] = value
-                simple_updates.append(update_desc)
+        if spec_patch:
+            await patch_cnpg_database_role_spec(namespace, crd_name, spec_patch)
 
-        await patch_cnpg_cluster_spec(
-            namespace,
-            cluster_name,
-            {"managed": {"roles": cluster["spec"]["managed"]["roles"]}},
-        )
-
-        updates_text = '\n- '.join(simple_updates)
-        return f"""Successfully updated PostgreSQL role '{role_name}' in cluster '{namespace}/{cluster_name}'.
+        updates_text = '\n- '.join(updates)
+        return f"""Successfully updated role '{role_name}' in cluster '{namespace}/{cluster_name}' (DatabaseRole CRD '{crd_name}').
 
 Updated Attributes:
 - {updates_text}
@@ -2064,18 +2466,23 @@ async def delete_postgres_role(
     context: MCPContext,
     cluster_name: str,
     role_name: str,
+    drop_role: bool = False,
     namespace: Optional[str] = None,
     dry_run: bool = False
 ) -> str:
     """
-    Delete a PostgreSQL role from a cluster using CloudNativePG's declarative role management.
+    Delete a PostgreSQL role by removing its DatabaseRole CRD.
 
-    Sets the role's ensure field to 'absent' or removes it from .spec.managed.roles.
-    Also deletes the associated Kubernetes secret.
+    Whether the role is actually dropped from PostgreSQL depends on the
+    databaseRoleReclaimPolicy set on the CRD. Pass drop_role=True to force the
+    policy to 'delete' before removing the CRD. The associated password Secret
+    is deleted in either case.
 
     Args:
         cluster_name: Name of the PostgreSQL cluster.
         role_name: Name of the role to delete.
+        drop_role: If True, force the reclaim policy to 'delete' so the role is
+                  dropped from PostgreSQL. Default is False.
         namespace: Kubernetes namespace.
         dry_run: If True, shows what would be deleted without performing the deletion.
                 Useful for previewing the deletion impact. Default is False.
@@ -2088,68 +2495,70 @@ async def delete_postgres_role(
         if namespace is None:
             namespace = get_current_namespace()
 
-        # Get the cluster
-        cluster = await get_cnpg_cluster(namespace, cluster_name)
-        managed_roles = cluster.get('spec', {}).get('managed', {}).get('roles', [])
-        secret_name = f"cnpg-{cluster_name}-user-{role_name}"
+        role = await find_cnpg_database_role(namespace, cluster_name, role_name)
+        spec = role.get("spec", {}) if role else {}
+        crd_name = role.get("metadata", {}).get("name") if role else database_role_crd_name(cluster_name, role_name)
+        secret_name = spec.get("passwordSecret", {}).get("name") or role_password_secret_name(cluster_name, role_name)
+        reclaim_policy = "delete" if drop_role else spec.get("databaseRoleReclaimPolicy", "retain")
 
-        # Find the role
-        role_index = next((i for i, r in enumerate(managed_roles) if r.get('name') == role_name), None)
-        role = managed_roles[role_index] if role_index is not None else None
-
-        # If dry_run, show what would be deleted
         if dry_run:
-            # Check if secret exists
             secret_exists = await read_role_secret(namespace, secret_name) is not None
+            action = "dropped from PostgreSQL" if reclaim_policy == "delete" else "retained in PostgreSQL"
+            attributes = format_database_role_attributes(spec) if role else "- (DatabaseRole CRD not found)"
 
             return f"""Dry run: Deletion preview for role '{role_name}' in cluster '{namespace}/{cluster_name}'
 
 Role details:
-- Managed Role Entry: {'exists' if role else 'not found'}
-{f"- Login: {role.get('login', False)}" if role else "- Login: unknown"}
-{f"- Superuser: {role.get('superuser', False)}" if role else "- Superuser: unknown"}
-{f"- Inherit: {role.get('inherit', True)}" if role else "- Inherit: unknown"}
-{f"- Create DB: {role.get('createdb', False)}" if role else "- Create DB: unknown"}
-{f"- Create Role: {role.get('createrole', False)}" if role else "- Create Role: unknown"}
-{f"- Replication: {role.get('replication', False)}" if role else "- Replication: unknown"}
+- DatabaseRole CRD: {crd_name} {'(exists)' if role else '(not found)'}
+{attributes}
 
 Resources that would be deleted:
-- Role definition from .spec.managed.roles in cluster CRD {'(exists)' if role else '(not found; no cluster patch needed)'}
+- DatabaseRole CRD: {crd_name} {'(exists)' if role else '(not found; nothing to delete)'}
 - Kubernetes secret: {secret_name} {'(exists)' if secret_exists else '(not found)'}
 
-WARNING: If the managed role entry exists, this operation will drop the role from PostgreSQL.
-Any objects owned by this role or permissions granted to it will be affected.
+Impact based on reclaim policy:
+- Reclaim Policy: {reclaim_policy}{' (forced by drop_role=True)' if drop_role else ''}
+- Result: The role will be {action}
+
+WARNING: If the role is dropped, any objects owned by it or permissions granted
+to it will be affected.
 
 To proceed with deletion, call delete_postgres_role again with dry_run=False (or omit the dry_run parameter).
 """
 
-        if role_index is None:
+        if role is None:
             secret_deleted = await delete_role_secret(namespace, secret_name)
             if secret_deleted:
                 return f"""Cleaned up orphaned PostgreSQL role secret for '{role_name}' in cluster '{namespace}/{cluster_name}'.
 
-The role was not present in .spec.managed.roles, so no cluster patch was needed.
+No DatabaseRole CRD existed for this role, so no CRD deletion was needed.
 Deleted orphaned secret: {secret_name}
 """
-            return f"Error: Role '{role_name}' not found in cluster '{namespace}/{cluster_name}', and associated secret '{secret_name}' was not found."
+            return f"Error: Role '{role_name}' has no DatabaseRole CRD in cluster '{namespace}/{cluster_name}', and associated secret '{secret_name}' was not found."
 
-        # Remove the role from the list
-        managed_roles.pop(role_index)
+        if drop_role and spec.get("databaseRoleReclaimPolicy") != "delete":
+            await patch_cnpg_database_role_spec(namespace, crd_name, {"databaseRoleReclaimPolicy": "delete"})
 
-        await patch_cnpg_cluster_spec(
-            namespace,
-            cluster_name,
-            {"managed": {"roles": managed_roles}},
+        custom_api, _ = get_kubernetes_clients()
+        await asyncio.to_thread(
+            custom_api.delete_namespaced_custom_object,
+            group=CNPG_GROUP,
+            version=CNPG_VERSION,
+            namespace=namespace,
+            plural=CNPG_DATABASE_ROLE_PLURAL,
+            name=crd_name
         )
 
-        # Delete the associated secret
         secret_deleted = await delete_role_secret(namespace, secret_name)
-
         secret_msg = f"\nAssociated secret '{secret_name}' was also deleted." if secret_deleted else ""
+        action = "will be dropped from PostgreSQL" if reclaim_policy == "delete" else "will be retained in PostgreSQL"
 
-        return f"""Successfully deleted PostgreSQL role '{role_name}' from cluster '{namespace}/{cluster_name}'.{secret_msg}
+        return f"""Successfully deleted DatabaseRole CRD '{crd_name}' for role '{role_name}' in cluster '{namespace}/{cluster_name}'.{secret_msg}
 
-The CloudNativePG operator will drop this role from the database.
+Reclaim Policy: {reclaim_policy}{' (forced by drop_role=True)' if drop_role else ''}
+Result: The role {action}.
+
+The CloudNativePG operator will reconcile this change.
 """
 
     except Exception as e:
@@ -2621,6 +3030,7 @@ def register_resources(mcp):
             "scale_postgres_cluster",
             "delete_postgres_cluster",
             "list_postgres_roles",
+            "get_postgres_role_status",
             "create_postgres_role",
             "update_postgres_role",
             "delete_postgres_role",
@@ -2812,10 +3222,27 @@ def register_tools(mcp):
         format: Literal["text", "json"] = "text",
         ctx: Context = None,
     ) -> str:
-        """List all PostgreSQL roles managed in a cluster."""
+        """List all PostgreSQL roles managed by CloudNativePG DatabaseRole CRDs."""
         return await list_postgres_roles(
             context=ctx,
             cluster_name=cluster_name,
+            namespace=namespace,
+            format=format,
+        )
+
+    @mcp.tool(name="get_postgres_role_status")
+    async def get_postgres_role_status_tool(
+        cluster_name: str,
+        role_name: str,
+        namespace: Optional[str] = None,
+        format: Literal["text", "json"] = "text",
+        ctx: Context = None,
+    ) -> str:
+        """Get a CloudNativePG DatabaseRole CRD's current spec values and reconciliation status."""
+        return await get_postgres_role_status(
+            context=ctx,
+            cluster_name=cluster_name,
+            role_name=role_name,
             namespace=namespace,
             format=format,
         )
@@ -2830,11 +3257,19 @@ def register_tools(mcp):
         createdb: bool = False,
         createrole: bool = False,
         replication: bool = False,
+        bypassrls: bool = False,
+        in_roles: List[str] = None,
+        connection_limit: int = None,
+        valid_until: str = None,
+        comment: str = None,
+        disable_password: bool = False,
+        client_certificate: bool = False,
+        reclaim_policy: Literal["retain", "delete"] = "retain",
         namespace: str = None,
         dry_run: bool = False,
         ctx: Context = None,
     ) -> str:
-        """Create a new PostgreSQL role with an auto-generated password secret."""
+        """Create a new PostgreSQL role using a DatabaseRole CRD, with an auto-generated password secret."""
         return await create_postgres_role(
             context=ctx,
             cluster_name=cluster_name,
@@ -2845,6 +3280,14 @@ def register_tools(mcp):
             createdb=createdb,
             createrole=createrole,
             replication=replication,
+            bypassrls=bypassrls,
+            in_roles=in_roles,
+            connection_limit=connection_limit,
+            valid_until=valid_until,
+            comment=comment,
+            disable_password=disable_password,
+            client_certificate=client_certificate,
+            reclaim_policy=reclaim_policy,
             namespace=namespace,
             dry_run=dry_run,
         )
@@ -2859,12 +3302,20 @@ def register_tools(mcp):
         createdb: bool = None,
         createrole: bool = None,
         replication: bool = None,
+        bypassrls: bool = None,
+        in_roles: List[str] = None,
+        connection_limit: int = None,
+        valid_until: str = None,
+        comment: str = None,
+        disable_password: bool = None,
+        client_certificate: bool = None,
+        reclaim_policy: Literal["retain", "delete"] = None,
         password: str = None,
         namespace: str = None,
         dry_run: bool = False,
         ctx: Context = None,
     ) -> str:
-        """Update an existing PostgreSQL role and optionally reset its password."""
+        """Update an existing PostgreSQL role's DatabaseRole CRD and optionally reset its password."""
         return await update_postgres_role(
             context=ctx,
             cluster_name=cluster_name,
@@ -2875,6 +3326,14 @@ def register_tools(mcp):
             createdb=createdb,
             createrole=createrole,
             replication=replication,
+            bypassrls=bypassrls,
+            in_roles=in_roles,
+            connection_limit=connection_limit,
+            valid_until=valid_until,
+            comment=comment,
+            disable_password=disable_password,
+            client_certificate=client_certificate,
+            reclaim_policy=reclaim_policy,
             password=password,
             namespace=namespace,
             dry_run=dry_run,
@@ -2884,15 +3343,17 @@ def register_tools(mcp):
     async def delete_postgres_role_tool(
         cluster_name: str,
         role_name: str,
+        drop_role: bool = False,
         namespace: str = None,
         dry_run: bool = False,
         ctx: Context = None,
     ) -> str:
-        """Delete a PostgreSQL role and its associated secret."""
+        """Delete a PostgreSQL role's DatabaseRole CRD and its associated secret."""
         return await delete_postgres_role(
             context=ctx,
             cluster_name=cluster_name,
             role_name=role_name,
+            drop_role=drop_role,
             namespace=namespace,
             dry_run=dry_run,
         )

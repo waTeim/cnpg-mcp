@@ -17,6 +17,7 @@ The server exposes the CloudNativePG tools from the v1 implementation:
 - `scale_postgres_cluster`
 - `delete_postgres_cluster`
 - `list_postgres_roles`
+- `get_postgres_role_status`
 - `create_postgres_role`
 - `update_postgres_role`
 - `delete_postgres_role`
@@ -24,6 +25,21 @@ The server exposes the CloudNativePG tools from the v1 implementation:
 - `get_postgres_database_status`
 - `create_postgres_database`
 - `delete_postgres_database`
+
+Roles are managed through CloudNativePG's first-class `DatabaseRole` CRD rather
+than the deprecated Cluster `.spec.managed.roles` field. `create_postgres_role`
+creates a `DatabaseRole` named `<cluster>-<role>` and, unless
+`disable_password` is set, generates a password Secret referenced by the CRD.
+Beyond the standard role flags (`login`, `superuser`, `inherit`, `createdb`,
+`createrole`, `replication`, `bypassrls`) it exposes the CRD's `in_roles`,
+`connection_limit`, `valid_until`, `comment`, `client_certificate`, and
+`reclaim_policy`. `update_postgres_role` patches the CRD spec and can rotate the
+password Secret; `delete_postgres_role` deletes the CRD, honoring its reclaim
+policy, and accepts `drop_role=True` to force the role to be dropped from
+PostgreSQL. `get_postgres_role_status` reports the CRD's current spec values and
+operator reconciliation status. `list_postgres_roles` lists `DatabaseRole` CRDs
+for a cluster and separately reports any legacy `.spec.managed.roles` entries
+still present on the Cluster.
 
 `create_postgres_database` supports CloudNativePG Database CRD create-time
 locale options, including `encoding`, `locale`, `locale_provider`,

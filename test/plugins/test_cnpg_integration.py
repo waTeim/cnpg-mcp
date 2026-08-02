@@ -110,6 +110,7 @@ class ServerInfoTest(TestPlugin):
             "scale_postgres_cluster",
             "delete_postgres_cluster",
             "list_postgres_roles",
+            "get_postgres_role_status",
             "create_postgres_role",
             "update_postgres_role",
             "delete_postgres_role",
@@ -424,13 +425,45 @@ class VerifyRoleCreatedTest(TestPlugin):
             return TestResult(self.get_name(), self.tool_name, False, "Test failed with exception", str(e), (time.time() - start_time) * 1000)
 
 
+class GetRoleStatusTest(TestPlugin):
+    """Verify the created role's DatabaseRole CRD status is reported."""
+
+    tool_name = "get_postgres_role_status"
+    description = "Verify DatabaseRole CRD status for the created role"
+    depends_on = ["CreatePostgresRoleTest"]
+    run_after = ["VerifyRoleCreatedTest"]
+
+    async def test(self, session, ctx: Optional[TestContext] = None) -> TestResult:
+        start_time = time.time()
+        state = _state(ctx)
+        cluster_name = state.get("test_cluster_name")
+        role_name = state.get("test_role_name")
+        if not _include_integration(ctx) or not cluster_name or not role_name:
+            return _skip(self, start_time, "no integration role available")
+        try:
+            response_text = await _call_text(
+                session,
+                self.tool_name,
+                _with_namespace({"cluster_name": cluster_name, "role_name": role_name}),
+            )
+            if failure := _operational_failure(self, start_time, "Tool executed but operation failed", response_text):
+                return failure
+            if role_name not in response_text:
+                return TestResult(self.get_name(), self.tool_name, False, f"Created role '{role_name}' not found", response_text[:500], (time.time() - start_time) * 1000)
+            if "Operator Status" not in response_text:
+                return TestResult(self.get_name(), self.tool_name, False, "Role status response missing operator status", response_text[:500], (time.time() - start_time) * 1000)
+            return TestResult(self.get_name(), self.tool_name, True, f"Verified DatabaseRole status for '{role_name}'", duration_ms=(time.time() - start_time) * 1000)
+        except Exception as e:
+            return TestResult(self.get_name(), self.tool_name, False, "Test failed with exception", str(e), (time.time() - start_time) * 1000)
+
+
 class UpdatePostgresRoleTest(TestPlugin):
     """Test updating the created PostgreSQL role."""
 
     tool_name = "update_postgres_role"
     description = "Test updating a PostgreSQL role"
     depends_on = ["CreatePostgresRoleTest"]
-    run_after = ["VerifyRoleCreatedTest"]
+    run_after = ["VerifyRoleCreatedTest", "GetRoleStatusTest"]
 
     async def test(self, session, ctx: Optional[TestContext] = None) -> TestResult:
         start_time = time.time()
@@ -585,7 +618,7 @@ class DeletePostgresRoleTest(TestPlugin):
         if not _include_integration(ctx) or not cluster_name or not role_name:
             return _skip(self, start_time, "no integration role available")
         try:
-            response_text = await _call_text(session, self.tool_name, _with_namespace({"cluster_name": cluster_name, "role_name": role_name}))
+            response_text = await _call_text(session, self.tool_name, _with_namespace({"cluster_name": cluster_name, "role_name": role_name, "drop_role": True}))
             if failure := _operational_failure(self, start_time, "Role deletion failed", response_text):
                 return failure
             state["test_role_name"] = None
@@ -607,6 +640,7 @@ class DeletePostgresClusterTest(TestPlugin):
         "ListRolesTest",
         "CreatePostgresRoleTest",
         "VerifyRoleCreatedTest",
+        "GetRoleStatusTest",
         "UpdatePostgresRoleTest",
         "DeletePostgresRoleTest",
         "ListDatabasesTest",
