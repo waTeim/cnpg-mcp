@@ -12,6 +12,7 @@ EXPECTED_CNPG_TOOLS = {
     "scale_postgres_cluster",
     "delete_postgres_cluster",
     "list_postgres_roles",
+    "get_postgres_role_status",
     "create_postgres_role",
     "update_postgres_role",
     "delete_postgres_role",
