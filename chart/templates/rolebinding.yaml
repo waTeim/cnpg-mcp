@@ -18,6 +18,17 @@ rules:
   - apiGroups: ["postgresql.cnpg.io"]
     resources: ["clusters", "databases", "databaseroles"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Switchover is requested through .status.targetPrimary on the status subresource
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters/status"]
+    verbs: ["get", "update", "patch"]
+  # Storage resize inspects instance volumes and recycles individual instances
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -68,6 +79,17 @@ rules:
   - apiGroups: ["postgresql.cnpg.io"]
     resources: ["clusters", "databases", "databaseroles"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Switchover is requested through .status.targetPrimary on the status subresource
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters/status"]
+    verbs: ["get", "update", "patch"]
+  # Storage resize inspects instance volumes and recycles individual instances
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
