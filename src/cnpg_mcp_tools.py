@@ -12,6 +12,7 @@ import base64
 import json
 import logging
 import os
+import re
 import secrets
 import string
 import sys
@@ -95,6 +96,32 @@ CNPG_VERSION = "v1"
 CNPG_PLURAL = "clusters"
 CNPG_DATABASE_PLURAL = "databases"
 CNPG_DATABASE_ROLE_PLURAL = "databaseroles"
+
+# Setting this Cluster annotation to "disabled" turns off the CloudNativePG
+# validating webhook, which is what makes an otherwise rejected storage shrink
+# possible. It is restored as soon as the change is applied.
+CNPG_VALIDATION_ANNOTATION = "cnpg.io/validation"
+
+STORAGE_QUANTITY_PATTERN = re.compile(
+    r"^(?P<number>[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)(?P<unit>Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E|m)?$"
+)
+
+STORAGE_UNIT_MULTIPLIERS = {
+    "": 1.0,
+    "m": 1e-3,
+    "k": 1e3,
+    "M": 1e6,
+    "G": 1e9,
+    "T": 1e12,
+    "P": 1e15,
+    "E": 1e18,
+    "Ki": float(2 ** 10),
+    "Mi": float(2 ** 20),
+    "Gi": float(2 ** 30),
+    "Ti": float(2 ** 40),
+    "Pi": float(2 ** 50),
+    "Ei": float(2 ** 60),
+}
 
 # Boolean DatabaseRole attributes, mapped to their display label and the value
 # PostgreSQL assumes when the field is left unset in the CRD.
@@ -424,6 +451,238 @@ async def patch_cnpg_cluster_spec(namespace: str, name: str, spec_patch: Dict[st
         )
     except ApiException as e:
         raise Exception(format_error_message(e, f"patching cluster {namespace}/{name}"))
+
+
+async def patch_cnpg_cluster_metadata(namespace: str, name: str, metadata_patch: Dict[str, Any]) -> Dict[str, Any]:
+    """Patch Cluster metadata. A None value in an annotation map removes the key."""
+    try:
+        custom_api, _ = get_kubernetes_clients()
+        return await asyncio.to_thread(
+            custom_api.patch_namespaced_custom_object,
+            group=CNPG_GROUP,
+            version=CNPG_VERSION,
+            namespace=namespace,
+            plural=CNPG_PLURAL,
+            name=name,
+            body={"metadata": metadata_patch},
+        )
+    except ApiException as e:
+        raise Exception(format_error_message(e, f"patching metadata of cluster {namespace}/{name}"))
+
+
+async def patch_cnpg_cluster_status(namespace: str, name: str, status_patch: Dict[str, Any]) -> Dict[str, Any]:
+    """Patch the Cluster status subresource.
+
+    CloudNativePG drives switchover through .status.targetPrimary, which lives on
+    the status subresource and is not reachable through a spec patch.
+    """
+    try:
+        custom_api, _ = get_kubernetes_clients()
+        return await asyncio.to_thread(
+            custom_api.patch_namespaced_custom_object_status,
+            group=CNPG_GROUP,
+            version=CNPG_VERSION,
+            namespace=namespace,
+            plural=CNPG_PLURAL,
+            name=name,
+            body={"status": status_patch},
+        )
+    except ApiException as e:
+        raise Exception(format_error_message(e, f"patching status of cluster {namespace}/{name}"))
+
+
+async def set_cluster_validation(namespace: str, name: str, value: Optional[str]) -> None:
+    """Set or clear the CloudNativePG validating-webhook annotation on a Cluster."""
+    await patch_cnpg_cluster_metadata(
+        namespace,
+        name,
+        {"annotations": {CNPG_VALIDATION_ANNOTATION: value}},
+    )
+
+
+def parse_storage_quantity(value: str) -> float:
+    """
+    Parse a Kubernetes storage quantity such as '10Gi', '500M', or '1024' into bytes.
+
+    Raises:
+        ValueError: If the value is not a recognizable Kubernetes quantity.
+    """
+    if value is None:
+        raise ValueError("storage size is not set")
+
+    match = STORAGE_QUANTITY_PATTERN.match(str(value).strip())
+    if not match:
+        raise ValueError(
+            f"'{value}' is not a valid Kubernetes storage quantity "
+            "(expected something like '10Gi', '500M', or '1024')."
+        )
+
+    number = float(match.group("number"))
+    return number * STORAGE_UNIT_MULTIPLIERS[match.group("unit") or ""]
+
+
+async def list_cluster_instance_pvcs(namespace: str, cluster_name: str) -> List[Dict[str, Any]]:
+    """
+    Summarize the PVCs backing a cluster's instances.
+
+    Each entry reports the requested size (spec) alongside the size the volume
+    actually reports (status), which differ while an expansion is in flight.
+    """
+    _, core_api = get_kubernetes_clients()
+    try:
+        pvcs = await asyncio.to_thread(
+            core_api.list_namespaced_persistent_volume_claim,
+            namespace=namespace,
+            label_selector=f"cnpg.io/cluster={cluster_name}",
+        )
+    except ApiException as e:
+        raise Exception(format_error_message(e, f"listing PVCs for cluster {namespace}/{cluster_name}"))
+
+    summaries = []
+    for pvc in pvcs.items:
+        labels = pvc.metadata.labels or {}
+        requested = (pvc.spec.resources.requests or {}).get("storage") if pvc.spec.resources else None
+        actual = (pvc.status.capacity or {}).get("storage") if pvc.status else None
+        summaries.append({
+            "pvc_name": pvc.metadata.name,
+            "instance": labels.get("cnpg.io/instanceName", pvc.metadata.name),
+            "pvc_role": labels.get("cnpg.io/pvcRole", "PG_DATA"),
+            "instance_role": labels.get("cnpg.io/instanceRole", "unknown"),
+            "requested_size": requested,
+            "actual_size": actual,
+            "phase": pvc.status.phase if pvc.status else None,
+        })
+
+    summaries.sort(key=lambda item: (item["instance"], item["pvc_role"]))
+    return summaries
+
+
+def summarize_resize_state(cluster: Dict[str, Any], pvcs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Compare the cluster's desired storage size against the PVCs backing it.
+
+    Returns the desired size, which instances already match it, which still hold
+    the previous size, and whether an in-place expansion is still running.
+    """
+    spec = cluster.get("spec", {})
+    status = cluster.get("status", {})
+    desired_size = spec.get("storage", {}).get("size")
+
+    try:
+        desired_bytes = parse_storage_quantity(desired_size)
+    except ValueError:
+        desired_bytes = None
+
+    matched, stale, expanding = [], [], []
+    for pvc in pvcs:
+        if pvc["pvc_role"] != "PG_DATA":
+            continue
+        try:
+            requested_bytes = parse_storage_quantity(pvc["requested_size"])
+        except ValueError:
+            stale.append(pvc)
+            continue
+
+        if desired_bytes is not None and requested_bytes != desired_bytes:
+            stale.append(pvc)
+            continue
+
+        matched.append(pvc)
+        try:
+            if pvc["actual_size"] and parse_storage_quantity(pvc["actual_size"]) < requested_bytes:
+                expanding.append(pvc)
+        except ValueError:
+            pass
+
+    healthy = set(status.get("instancesStatus", {}).get("healthy", []))
+    stale_names = [pvc["instance"] for pvc in stale]
+    matched_names = [pvc["instance"] for pvc in matched]
+
+    return {
+        "desired_size": desired_size,
+        "matched": matched,
+        "stale": stale,
+        "expanding": expanding,
+        "matched_names": matched_names,
+        "stale_names": stale_names,
+        "healthy": healthy,
+        "primary": status.get("currentPrimary"),
+        "target_primary": status.get("targetPrimary"),
+        "validation_disabled": (cluster.get("metadata", {}).get("annotations", {}) or {}).get(
+            CNPG_VALIDATION_ANNOTATION
+        ) == "disabled",
+    }
+
+
+def describe_resize_next_step(cluster: Dict[str, Any], state: Dict[str, Any]) -> str:
+    """Recommend the next action in a storage resize workflow."""
+    spec = cluster.get("spec", {})
+    name = cluster.get("metadata", {}).get("name", "unknown")
+    namespace = cluster.get("metadata", {}).get("namespace", "unknown")
+    primary = state["primary"]
+    stale_names = state["stale_names"]
+
+    lines = []
+    if state["validation_disabled"]:
+        lines.append(
+            f"WARNING: validation is still disabled on this cluster. Re-enable it with "
+            f"resize_postgres_cluster(..., restore_validation_only=True) or by removing the "
+            f"'{CNPG_VALIDATION_ANNOTATION}' annotation before doing anything else."
+        )
+
+    if state["target_primary"] and state["target_primary"] != primary:
+        lines.append(f"A switchover to '{state['target_primary']}' is in progress. Wait for it to complete.")
+        return "\n".join(lines)
+
+    if not stale_names:
+        if state["expanding"]:
+            expanding = ", ".join(pvc["instance"] for pvc in state["expanding"])
+            lines.append(
+                f"Volume expansion is still in progress on: {expanding}. The volumes have accepted the "
+                f"new request but still report the old size.\n"
+                f"If this does not clear, the storage class may not actually support expansion. Check:\n"
+                f"  kubectl describe pvc -n {namespace} -l cnpg.io/cluster={name}\n"
+                f"A 'waiting for an external controller to expand this PVC' event means the provisioner "
+                f"advertises allowVolumeExpansion but has no resize controller; the volumes will not grow "
+                f"in place on that storage class."
+            )
+        else:
+            lines.append(
+                f"All instances are at the desired size ({state['desired_size']}). "
+                f"Resize is complete. Current instance count is {spec.get('instances')}; "
+                f"use scale_postgres_cluster to return to your target count if you added an instance."
+            )
+        return "\n".join(lines)
+
+    resized_healthy = [n for n in state["matched_names"] if n in state["healthy"]]
+
+    if primary in stale_names:
+        if resized_healthy:
+            candidate = resized_healthy[0]
+            lines.append(
+                f"The primary '{primary}' still holds the previous size. Promote a resized, healthy "
+                f"instance and then remove the old one:\n"
+                f"  promote_cluster_instance(name=\"{name}\", instance=\"{candidate}\", namespace=\"{namespace}\")"
+            )
+        else:
+            lines.append(
+                f"The primary '{primary}' still holds the previous size and no resized instance is healthy yet. "
+                "Wait for the new instance to finish replicating before promoting it."
+            )
+        return "\n".join(lines)
+
+    stale_replicas = [n for n in stale_names if n != primary]
+    lines.append(
+        f"The primary '{primary}' is at the desired size. Recycle the remaining instance(s) still at the "
+        f"previous size, one at a time, waiting for each to become healthy before the next:\n"
+        + "\n".join(
+            f"  delete_cluster_instance(name=\"{name}\", instance=\"{instance}\", "
+            f"namespace=\"{namespace}\", confirm_deletion=True)"
+            for instance in stale_replicas
+        )
+        + "\n\nCloudNativePG recreates each deleted instance from the primary at the current size."
+    )
+    return "\n".join(lines)
 
 
 async def get_cnpg_database(namespace: str, cluster_name: str, database_name: str) -> Dict[str, Any]:
@@ -920,6 +1179,91 @@ class ListRolesInput(BaseModel):
     namespace: Optional[str] = Field(
         None,
         description="Kubernetes namespace where the cluster exists. If not specified, uses the current namespace from your Kubernetes context."
+    )
+
+
+class ResizeClusterInput(BaseModel):
+    """Input for resizing cluster storage."""
+    name: str = Field(..., description="Name of the CloudNativePG cluster.")
+    storage_size: Optional[str] = Field(
+        None,
+        description="Desired per-instance storage size, for example '20Gi'. Required unless restore_validation_only=True.",
+        examples=["10Gi", "50Gi", "100Gi"]
+    )
+    extra_instances: int = Field(
+        1,
+        description="How many instances to add alongside a shrink so the new size has an instance to land on. Ignored when growing.",
+        ge=1,
+        le=5
+    )
+    confirm_shrink: bool = Field(
+        False,
+        description="Must be True to start a shrink. Shrinking temporarily disables validation and rebuilds every instance."
+    )
+    restore_validation_only: bool = Field(
+        False,
+        description="If True, only re-enable the CloudNativePG validating webhook and change nothing else. Use to recover if a previous run left validation disabled."
+    )
+    namespace: Optional[str] = Field(
+        None,
+        description="Kubernetes namespace where the cluster exists. If not specified, uses the current namespace from your Kubernetes context."
+    )
+    dry_run: bool = Field(
+        False,
+        description="If True, shows what would be changed without applying it."
+    )
+
+
+class GetResizeStatusInput(BaseModel):
+    """Input for getting cluster storage resize status."""
+    name: str = Field(..., description="Name of the CloudNativePG cluster.")
+    namespace: Optional[str] = Field(
+        None,
+        description="Kubernetes namespace where the cluster exists. If not specified, uses the current namespace from your Kubernetes context."
+    )
+
+
+class PromoteInstanceInput(BaseModel):
+    """Input for promoting a cluster instance to primary."""
+    name: str = Field(..., description="Name of the CloudNativePG cluster.")
+    instance: str = Field(
+        ...,
+        description="Name of the instance to promote, for example 'my-cluster-4'.",
+        examples=["my-cluster-2", "production-db-4"]
+    )
+    force: bool = Field(
+        False,
+        description="Promote even when the operator does not report the instance as healthy. Unsafe: an instance still catching up can lose recently written data."
+    )
+    namespace: Optional[str] = Field(
+        None,
+        description="Kubernetes namespace where the cluster exists. If not specified, uses the current namespace from your Kubernetes context."
+    )
+    dry_run: bool = Field(
+        False,
+        description="If True, shows what would happen without performing the switchover."
+    )
+
+
+class DeleteInstanceInput(BaseModel):
+    """Input for deleting a single cluster instance."""
+    name: str = Field(..., description="Name of the CloudNativePG cluster.")
+    instance: str = Field(
+        ...,
+        description="Name of the instance to delete, for example 'my-cluster-1'. The operator recreates it at the cluster's current storage size.",
+        examples=["my-cluster-1", "production-db-3"]
+    )
+    confirm_deletion: bool = Field(
+        False,
+        description="Must be True to perform the deletion. This destroys the instance's copy of the data until it is rebuilt."
+    )
+    namespace: Optional[str] = Field(
+        None,
+        description="Kubernetes namespace where the cluster exists. If not specified, uses the current namespace from your Kubernetes context."
+    )
+    dry_run: bool = Field(
+        False,
+        description="If True, shows what would be deleted without deleting it."
     )
 
 
@@ -1722,6 +2066,614 @@ get_cluster_status(namespace="{namespace}", name="{name}")
 
     except Exception as e:
         return format_error_message(e, f"scaling cluster {namespace}/{name}")
+
+
+
+@with_mcp_context
+async def resize_postgres_cluster(
+    context: MCPContext,
+    name: str,
+    storage_size: Optional[str] = None,
+    extra_instances: int = 1,
+    confirm_shrink: bool = False,
+    restore_validation_only: bool = False,
+    namespace: Optional[str] = None,
+    dry_run: bool = False
+) -> str:
+    """
+    Start a storage resize of a PostgreSQL cluster.
+
+    Growing is applied directly: CloudNativePG expands the existing volumes in
+    place when the storage class allows it.
+
+    Shrinking cannot be applied to existing volumes at all, so this tool only
+    STARTS the migration and returns immediately. It temporarily disables the
+    CloudNativePG validating webhook, sets the smaller .spec.storage.size while
+    simultaneously adding instances in the same patch (so the new instance is
+    created at the new size), then restores validation. The rest of the
+    workflow is driven by separate tools, because replication can take hours:
+
+      1. resize_postgres_cluster(...)      <- you are here
+      2. get_cluster_resize_status(...)    poll until the new instance is healthy
+      3. promote_cluster_instance(...)     make the new, smaller instance primary
+      4. delete_cluster_instance(...)      recycle each old instance, one at a time
+      5. scale_postgres_cluster(...)       return to your original instance count
+
+    Args:
+        name: Name of the cluster to resize.
+        storage_size: Desired per-instance storage size, for example '20Gi'.
+        extra_instances: How many instances to add alongside a shrink so the new
+                        size gets a home. Default 1. Ignored when growing.
+        confirm_shrink: Must be True to start a shrink. Required because shrinking
+                       disables validation and rebuilds every instance.
+        restore_validation_only: If True, only re-enable the validating webhook
+                                and make no other change. Use this to recover if
+                                a previous run left validation disabled.
+        namespace: Kubernetes namespace where the cluster exists.
+        dry_run: If True, shows what would be changed without applying it.
+
+    Returns:
+        A description of what was started and what to do next.
+        If dry_run=True, returns a preview of the changes.
+    """
+    try:
+        if namespace is None:
+            namespace = get_current_namespace()
+
+        cluster = await get_cnpg_cluster(namespace, name)
+        spec = cluster.get("spec", {})
+        annotations = cluster.get("metadata", {}).get("annotations", {}) or {}
+        current_size = spec.get("storage", {}).get("size")
+        current_instances = spec.get("instances", 0)
+        validation_disabled = annotations.get(CNPG_VALIDATION_ANNOTATION) == "disabled"
+
+        if restore_validation_only:
+            if not validation_disabled:
+                return (
+                    f"Validation is already enabled on cluster '{namespace}/{name}' "
+                    f"(annotation '{CNPG_VALIDATION_ANNOTATION}' is not set to 'disabled'). No change made."
+                )
+            if dry_run:
+                return f"""Dry run: Restore validation on cluster '{namespace}/{name}'
+
+The '{CNPG_VALIDATION_ANNOTATION}' annotation would be removed, re-enabling the
+CloudNativePG validating webhook.
+
+To apply this change, call resize_postgres_cluster again with dry_run=False.
+"""
+            await set_cluster_validation(namespace, name, None)
+            return f"""Re-enabled the CloudNativePG validating webhook on cluster '{namespace}/{name}'.
+
+The '{CNPG_VALIDATION_ANNOTATION}' annotation has been removed.
+"""
+
+        if storage_size is None:
+            return "Error: storage_size is required unless restore_validation_only=True."
+
+        try:
+            desired_bytes = parse_storage_quantity(storage_size)
+        except ValueError as e:
+            return f"Error: {e}"
+
+        try:
+            current_bytes = parse_storage_quantity(current_size)
+        except ValueError:
+            return (
+                f"Error: cluster '{namespace}/{name}' has an unreadable .spec.storage.size "
+                f"({current_size!r}). Resize the volumes manually or fix the cluster spec first."
+            )
+
+        if desired_bytes == current_bytes:
+            return (
+                f"Cluster '{namespace}/{name}' storage is already set to {current_size}. No change made.\n\n"
+                f"Use get_cluster_resize_status(name=\"{name}\", namespace=\"{namespace}\") to check whether "
+                "every instance has caught up to that size."
+            )
+
+        # ------------------------------------------------------------------
+        # Growing: a plain spec patch, expanded in place by the operator
+        # ------------------------------------------------------------------
+        if desired_bytes > current_bytes:
+            resize_in_use = spec.get("storage", {}).get("resizeInUseVolumes", True)
+            in_use_note = (
+                "Existing volumes will be expanded in place (requires a storage class with "
+                "allowVolumeExpansion: true)."
+                if resize_in_use
+                else "NOTE: .spec.storage.resizeInUseVolumes is false, so existing volumes will NOT be "
+                     "expanded; only newly created instances get the larger size."
+            )
+
+            if dry_run:
+                return f"""Dry run: Storage growth for cluster '{namespace}/{name}'
+
+Current configuration:
+- Storage size: {current_size}
+- Instances: {current_instances}
+
+Proposed changes:
+- Storage size: {current_size} -> {storage_size}
+
+Impact:
+- {in_use_note}
+- No instances are added or removed, and no switchover is needed.
+
+To apply this change, call resize_postgres_cluster again with dry_run=False (or omit the dry_run parameter).
+"""
+
+            await patch_cnpg_cluster_spec(namespace, name, {"storage": {"size": storage_size}})
+
+            return f"""Successfully requested storage growth for cluster '{namespace}/{name}': {current_size} -> {storage_size}.
+
+{in_use_note}
+
+Expansion is asynchronous. Monitor per-instance volume sizes with:
+get_cluster_resize_status(name="{name}", namespace="{namespace}")
+"""
+
+        # ------------------------------------------------------------------
+        # Shrinking: validation off -> size + instances -> validation on
+        # ------------------------------------------------------------------
+        if extra_instances < 1:
+            return "Error: extra_instances must be at least 1 when shrinking, so the new size has an instance to land on."
+
+        target_instances = current_instances + extra_instances
+
+        if dry_run:
+            return f"""Dry run: Storage shrink for cluster '{namespace}/{name}'
+
+Current configuration:
+- Storage size: {current_size}
+- Instances: {current_instances}
+- Primary: {cluster.get('status', {}).get('currentPrimary', 'unknown')}
+
+Proposed changes (applied as three requests):
+1. Set annotation {CNPG_VALIDATION_ANNOTATION}=disabled
+2. Patch .spec.storage.size {current_size} -> {storage_size} and
+   .spec.instances {current_instances} -> {target_instances} in a single request
+3. Remove annotation {CNPG_VALIDATION_ANNOTATION}, re-enabling validation
+
+Impact:
+- Existing volumes are NEVER shrunk in place. The {extra_instances} added instance(s)
+  are created at {storage_size} and clone from the current primary.
+- Every existing instance keeps {current_size} until it is recycled in step 4 of the workflow.
+- The new instance must hold all current data. Verify {storage_size} is large enough first.
+- While validation is disabled the operator accepts unsafe changes, so this window is
+  kept as short as possible and validation is restored even if the patch fails.
+
+To start this resize, call resize_postgres_cluster again with confirm_shrink=True and dry_run=False.
+"""
+
+        if not confirm_shrink:
+            return f"""WARNING: SHRINK NOT CONFIRMED
+
+You are about to shrink storage for cluster '{namespace}/{name}' from {current_size} to {storage_size}.
+
+This is not an in-place operation. CloudNativePG cannot shrink an existing volume, so
+this procedure temporarily disables the validating webhook, adds {extra_instances} instance(s)
+at the smaller size, and then requires you to promote and recycle instances until every
+instance has been rebuilt.
+
+Before proceeding, confirm that:
+- {storage_size} is large enough to hold all current data (check actual usage, not just the volume size)
+- You have a current backup
+- You can tolerate a switchover on this cluster
+
+To start, call this tool again with confirm_shrink=True:
+
+resize_postgres_cluster(
+    name="{name}",
+    namespace="{namespace}",
+    storage_size="{storage_size}",
+    confirm_shrink=True
+)
+
+To preview without changing anything, pass dry_run=True.
+"""
+
+        # Disable validation, apply the change, and restore validation even on failure.
+        await set_cluster_validation(namespace, name, "disabled")
+        try:
+            await patch_cnpg_cluster_spec(
+                namespace,
+                name,
+                {"storage": {"size": storage_size}, "instances": target_instances},
+            )
+        finally:
+            try:
+                await set_cluster_validation(namespace, name, annotations.get(CNPG_VALIDATION_ANNOTATION))
+            except Exception as restore_error:
+                logger.error(
+                    "Failed to restore the %s annotation on cluster %s/%s: %s",
+                    CNPG_VALIDATION_ANNOTATION,
+                    namespace,
+                    name,
+                    restore_error,
+                )
+                return f"""Storage shrink was applied to cluster '{namespace}/{name}', but VALIDATION COULD NOT BE RESTORED.
+
+The '{CNPG_VALIDATION_ANNOTATION}' annotation is still set to 'disabled', so the operator is
+currently accepting unvalidated changes to this cluster. Restore it now:
+
+resize_postgres_cluster(name="{name}", namespace="{namespace}", restore_validation_only=True)
+
+Restore error: {restore_error}
+"""
+
+        return f"""Started storage shrink for cluster '{namespace}/{name}': {current_size} -> {storage_size}.
+
+Applied:
+- .spec.storage.size: {current_size} -> {storage_size}
+- .spec.instances: {current_instances} -> {target_instances}
+- Validation was disabled for the patch and has been restored.
+
+The {extra_instances} new instance(s) are created at {storage_size} and clone from the primary.
+Existing instances keep {current_size} until they are recycled. This can take a long time.
+
+Next steps:
+1. Poll until the new instance is healthy:
+   get_cluster_resize_status(name="{name}", namespace="{namespace}")
+2. Promote it:
+   promote_cluster_instance(name="{name}", instance="<new-instance>", namespace="{namespace}")
+3. Recycle each remaining instance still at {current_size}, one at a time:
+   delete_cluster_instance(name="{name}", instance="<old-instance>", namespace="{namespace}", confirm_deletion=True)
+4. Return to your original instance count:
+   scale_postgres_cluster(name="{name}", instances={current_instances}, namespace="{namespace}")
+"""
+
+    except Exception as e:
+        return format_error_message(e, f"resizing cluster {namespace}/{name}")
+
+
+
+@with_mcp_context
+async def get_cluster_resize_status(
+    context: MCPContext,
+    name: str,
+    namespace: Optional[str] = None,
+    format: Literal["text", "json"] = "text"
+) -> str:
+    """
+    Report storage resize progress for a PostgreSQL cluster.
+
+    Compares the cluster's desired .spec.storage.size against the volume backing
+    each instance, reports which instances are still on the previous size, and
+    recommends the next step in the resize workflow.
+
+    Args:
+        name: Name of the cluster.
+        namespace: Kubernetes namespace where the cluster exists.
+        format: Output format. 'text' for human-readable (default), 'json' for structured
+               data that can be programmatically consumed.
+
+    Returns:
+        Per-instance volume sizes, replication health, and the recommended next action.
+    """
+    try:
+        if namespace is None:
+            namespace = get_current_namespace()
+
+        cluster = await get_cnpg_cluster(namespace, name)
+        pvcs = await list_cluster_instance_pvcs(namespace, name)
+        state = summarize_resize_state(cluster, pvcs)
+        next_step = describe_resize_next_step(cluster, state)
+
+        spec = cluster.get("spec", {})
+        status = cluster.get("status", {})
+        reported = status.get("instancesReportedState", {})
+
+        if format == "json":
+            return json.dumps({
+                "cluster": f"{namespace}/{name}",
+                "desired_size": state["desired_size"],
+                "instances": spec.get("instances"),
+                "ready_instances": status.get("readyInstances"),
+                "phase": status.get("phase"),
+                "primary": state["primary"],
+                "target_primary": state["target_primary"],
+                "validation_disabled": state["validation_disabled"],
+                "resize_complete": not state["stale"] and not state["expanding"],
+                "instances_at_desired_size": state["matched_names"],
+                "instances_at_previous_size": state["stale_names"],
+                "expanding": [pvc["instance"] for pvc in state["expanding"]],
+                "healthy_instances": sorted(state["healthy"]),
+                "volumes": pvcs,
+                "next_step": next_step,
+            }, indent=2)
+
+        result = f"**Storage resize status: {namespace}/{name}**\n"
+        result += f"- Desired size (.spec.storage.size): {state['desired_size']}\n"
+        result += f"- Instances: {status.get('readyInstances', 0)}/{spec.get('instances', 0)} ready\n"
+        result += f"- Phase: {status.get('phase', 'Unknown')}\n"
+        result += f"- Primary: {state['primary']}\n"
+        if state["target_primary"] and state["target_primary"] != state["primary"]:
+            result += f"- Target Primary: {state['target_primary']} (switchover in progress)\n"
+        result += f"- Validation: {'DISABLED' if state['validation_disabled'] else 'enabled'}\n"
+
+        result += "\n**Volumes:**\n"
+        if not pvcs:
+            result += "- (no PVCs found for this cluster)\n"
+        for pvc in pvcs:
+            instance = pvc["instance"]
+            markers = []
+            if instance == state["primary"]:
+                markers.append("primary")
+            if instance in state["healthy"]:
+                markers.append("healthy")
+            if instance in state["stale_names"]:
+                markers.append("PREVIOUS SIZE")
+            actual = pvc["actual_size"]
+            size = pvc["requested_size"]
+            if actual and actual != size:
+                size = f"{size} requested / {actual} actual"
+            role_suffix = "" if pvc["pvc_role"] == "PG_DATA" else f" [{pvc['pvc_role']}]"
+            marker_suffix = f" ({', '.join(markers)})" if markers else ""
+            result += f"- {instance}{role_suffix}: {size}{marker_suffix}\n"
+
+        if reported:
+            result += "\n**Reported instance state:**\n"
+            for instance, info in sorted(reported.items()):
+                result += (
+                    f"- {instance}: primary={info.get('isPrimary', False)}, "
+                    f"timeline={info.get('timeLineID', 'unknown')}\n"
+                )
+
+        result += f"\n**Next step:**\n{next_step}\n"
+        return truncate_response(result)
+
+    except Exception as e:
+        return format_error_message(e, f"getting resize status for cluster {namespace}/{name}")
+
+
+
+@with_mcp_context
+async def promote_cluster_instance(
+    context: MCPContext,
+    name: str,
+    instance: str,
+    force: bool = False,
+    namespace: Optional[str] = None,
+    dry_run: bool = False
+) -> str:
+    """
+    Promote an instance to primary, performing a controlled switchover.
+
+    Sets .status.targetPrimary, which is how CloudNativePG is asked to switch
+    over. The operator demotes the current primary and promotes the requested
+    instance once it has caught up.
+
+    Args:
+        name: Name of the cluster.
+        instance: Name of the instance to promote, for example 'my-cluster-4'.
+        force: Promote even when the operator does not currently report the
+              instance as healthy. Unsafe: an instance that is still catching up
+              can lose recently written data. Default False.
+        namespace: Kubernetes namespace where the cluster exists.
+        dry_run: If True, shows what would happen without performing the switchover.
+
+    Returns:
+        Success message, or an explanation of why the promotion was refused.
+    """
+    try:
+        if namespace is None:
+            namespace = get_current_namespace()
+
+        cluster = await get_cnpg_cluster(namespace, name)
+        status = cluster.get("status", {})
+        instance_names = status.get("instanceNames", [])
+        current_primary = status.get("currentPrimary")
+        target_primary = status.get("targetPrimary")
+        healthy = status.get("instancesStatus", {}).get("healthy", [])
+
+        if instance_names and instance not in instance_names:
+            return (
+                f"Error: instance '{instance}' is not part of cluster '{namespace}/{name}'.\n\n"
+                f"Known instances: {', '.join(instance_names)}"
+            )
+
+        if instance == current_primary:
+            return f"Instance '{instance}' is already the primary of cluster '{namespace}/{name}'. No change made."
+
+        if target_primary and target_primary != current_primary:
+            return (
+                f"Error: a switchover to '{target_primary}' is already in progress on cluster "
+                f"'{namespace}/{name}'. Wait for it to finish before promoting another instance."
+            )
+
+        is_healthy = instance in healthy
+        if not is_healthy and not force:
+            return f"""Error: instance '{instance}' is not currently reported healthy by the operator.
+
+Healthy instances: {', '.join(healthy) if healthy else '(none)'}
+
+Promoting an instance that has not finished replicating can lose recently written data.
+Wait until it is healthy, or pass force=True if you accept that risk.
+
+Check progress with:
+get_cluster_resize_status(name="{name}", namespace="{namespace}")
+"""
+
+        if dry_run:
+            return f"""Dry run: Switchover preview for cluster '{namespace}/{name}'
+
+Current primary: {current_primary}
+Requested primary: {instance} ({'healthy' if is_healthy else 'NOT healthy'})
+
+What would happen:
+- .status.targetPrimary would be set to '{instance}'
+- CloudNativePG would demote '{current_primary}' and promote '{instance}'
+- Client connections through the -rw service are interrupted briefly during the switchover
+
+To perform this switchover, call promote_cluster_instance again with dry_run=False (or omit the dry_run parameter).
+"""
+
+        await patch_cnpg_cluster_status(namespace, name, {"targetPrimary": instance})
+
+        health_note = "" if is_healthy else "\nWARNING: this instance was not reported healthy; force=True was used.\n"
+
+        return f"""Requested switchover of cluster '{namespace}/{name}' from '{current_primary}' to '{instance}'.
+{health_note}
+The operator demotes the current primary and promotes '{instance}'. Connections through the
+-rw service are briefly interrupted.
+
+Monitor the switchover with:
+get_cluster_resize_status(name="{name}", namespace="{namespace}")
+"""
+
+    except Exception as e:
+        return format_error_message(e, f"promoting instance {instance} in cluster {namespace}/{name}")
+
+
+
+@with_mcp_context
+async def delete_cluster_instance(
+    context: MCPContext,
+    name: str,
+    instance: str,
+    confirm_deletion: bool = False,
+    namespace: Optional[str] = None,
+    dry_run: bool = False
+) -> str:
+    """
+    Delete a single instance of a cluster so CloudNativePG rebuilds it.
+
+    Deletes the instance's PVCs and Pod. Because .spec.instances is left alone,
+    the operator immediately recreates the instance, cloning it from the primary
+    at the cluster's current .spec.storage.size. This is how an instance still
+    holding the previous storage size is recycled after a shrink.
+
+    To permanently reduce the instance count instead, use scale_postgres_cluster.
+
+    Args:
+        name: Name of the cluster.
+        instance: Name of the instance to delete, for example 'my-cluster-1'.
+        confirm_deletion: Must be True to perform the deletion.
+        namespace: Kubernetes namespace where the cluster exists.
+        dry_run: If True, shows what would be deleted without deleting it.
+
+    Returns:
+        Success message, or a preview when dry_run=True.
+    """
+    try:
+        if namespace is None:
+            namespace = get_current_namespace()
+
+        cluster = await get_cnpg_cluster(namespace, name)
+        status = cluster.get("status", {})
+        spec = cluster.get("spec", {})
+        instance_names = status.get("instanceNames", [])
+        current_primary = status.get("currentPrimary")
+        healthy = status.get("instancesStatus", {}).get("healthy", [])
+
+        if instance_names and instance not in instance_names:
+            return (
+                f"Error: instance '{instance}' is not part of cluster '{namespace}/{name}'.\n\n"
+                f"Known instances: {', '.join(instance_names)}"
+            )
+
+        if instance == current_primary:
+            return f"""Error: '{instance}' is the current primary of cluster '{namespace}/{name}' and cannot be deleted.
+
+Promote another instance first:
+promote_cluster_instance(name="{name}", instance="<other-instance>", namespace="{namespace}")
+"""
+
+        pvcs = [pvc for pvc in await list_cluster_instance_pvcs(namespace, name) if pvc["instance"] == instance]
+        pvc_names = [pvc["pvc_name"] for pvc in pvcs]
+        remaining_healthy = [i for i in healthy if i != instance]
+
+        if dry_run or not confirm_deletion:
+            heading = (
+                f"Dry run: Deletion preview for instance '{instance}' of cluster '{namespace}/{name}'"
+                if dry_run
+                else "WARNING: DELETION NOT CONFIRMED"
+            )
+            volume_lines = "\n".join(
+                f"  - {pvc['pvc_name']} ({pvc['pvc_role']}): {pvc['requested_size']}" for pvc in pvcs
+            ) or "  (none found)"
+
+            footer = (
+                f"To proceed, call delete_cluster_instance again with dry_run=False."
+                if dry_run
+                else f"""To proceed with deletion, call this tool again with confirm_deletion=True:
+
+delete_cluster_instance(
+    name="{name}",
+    instance="{instance}",
+    namespace="{namespace}",
+    confirm_deletion=True
+)"""
+            )
+
+            return f"""{heading}
+
+Resources that would be deleted:
+- Pod: {instance}
+- PVCs:
+{volume_lines}
+
+What happens next:
+- .spec.instances stays at {spec.get('instances')}, so CloudNativePG recreates '{instance}'
+  from the primary at the current size ({spec.get('storage', {}).get('size')}).
+- Rebuilding requires a full clone from the primary and can take a long time.
+
+Cluster state:
+- Current primary: {current_primary}
+- Instances still healthy after this deletion: {', '.join(remaining_healthy) if remaining_healthy else '(none)'}
+
+WARNING: This destroys this instance's copy of the data. Only the primary and any
+remaining healthy replicas will hold the data until the rebuild finishes.
+
+{footer}
+"""
+
+        _, core_api = get_kubernetes_clients()
+
+        # Delete the PVCs first: pvc-protection keeps them alive until the pod is
+        # gone, so the operator cannot reattach them to a fresh pod.
+        deleted_pvcs = []
+        for pvc_name in pvc_names:
+            try:
+                await asyncio.to_thread(
+                    core_api.delete_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=namespace,
+                )
+                deleted_pvcs.append(pvc_name)
+            except ApiException as e:
+                if e.status != 404:
+                    raise
+
+        pod_deleted = True
+        try:
+            await asyncio.to_thread(
+                core_api.delete_namespaced_pod,
+                name=instance,
+                namespace=namespace,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                pod_deleted = False
+            else:
+                raise
+
+        pvc_msg = ", ".join(deleted_pvcs) if deleted_pvcs else "(none)"
+
+        return f"""Deleted instance '{instance}' of cluster '{namespace}/{name}'.
+
+Removed:
+- PVCs: {pvc_msg}
+- Pod: {instance}{'' if pod_deleted else ' (was already gone)'}
+
+CloudNativePG will recreate '{instance}' from the primary at {spec.get('storage', {}).get('size')},
+because .spec.instances is still {spec.get('instances')}.
+
+Wait for the rebuild to finish before recycling another instance:
+get_cluster_resize_status(name="{name}", namespace="{namespace}")
+"""
+
+    except Exception as e:
+        return format_error_message(e, f"deleting instance {instance} of cluster {namespace}/{name}")
+
 
 
 
@@ -3028,6 +3980,10 @@ def register_resources(mcp):
             "get_cluster_status",
             "create_postgres_cluster",
             "scale_postgres_cluster",
+            "resize_postgres_cluster",
+            "get_cluster_resize_status",
+            "promote_cluster_instance",
+            "delete_cluster_instance",
             "delete_postgres_cluster",
             "list_postgres_roles",
             "get_postgres_role_status",
@@ -3194,6 +4150,82 @@ def register_tools(mcp):
             context=ctx,
             name=name,
             instances=instances,
+            namespace=namespace,
+            dry_run=dry_run,
+        )
+
+    @mcp.tool(name="resize_postgres_cluster")
+    async def resize_postgres_cluster_tool(
+        name: str,
+        storage_size: str = None,
+        extra_instances: int = 1,
+        confirm_shrink: bool = False,
+        restore_validation_only: bool = False,
+        namespace: str = None,
+        dry_run: bool = False,
+        ctx: Context = None,
+    ) -> str:
+        """Start a storage resize of a PostgreSQL cluster (grow in place, or begin a shrink migration)."""
+        return await resize_postgres_cluster(
+            context=ctx,
+            name=name,
+            storage_size=storage_size,
+            extra_instances=extra_instances,
+            confirm_shrink=confirm_shrink,
+            restore_validation_only=restore_validation_only,
+            namespace=namespace,
+            dry_run=dry_run,
+        )
+
+    @mcp.tool(name="get_cluster_resize_status")
+    async def get_cluster_resize_status_tool(
+        name: str,
+        namespace: str = None,
+        format: Literal["text", "json"] = "text",
+        ctx: Context = None,
+    ) -> str:
+        """Report per-instance storage sizes, resize progress, and the recommended next step."""
+        return await get_cluster_resize_status(
+            context=ctx,
+            name=name,
+            namespace=namespace,
+            format=format,
+        )
+
+    @mcp.tool(name="promote_cluster_instance")
+    async def promote_cluster_instance_tool(
+        name: str,
+        instance: str,
+        force: bool = False,
+        namespace: str = None,
+        dry_run: bool = False,
+        ctx: Context = None,
+    ) -> str:
+        """Promote a cluster instance to primary, performing a controlled switchover."""
+        return await promote_cluster_instance(
+            context=ctx,
+            name=name,
+            instance=instance,
+            force=force,
+            namespace=namespace,
+            dry_run=dry_run,
+        )
+
+    @mcp.tool(name="delete_cluster_instance")
+    async def delete_cluster_instance_tool(
+        name: str,
+        instance: str,
+        confirm_deletion: bool = False,
+        namespace: str = None,
+        dry_run: bool = False,
+        ctx: Context = None,
+    ) -> str:
+        """Delete one cluster instance so CloudNativePG rebuilds it at the cluster's current storage size."""
+        return await delete_cluster_instance(
+            context=ctx,
+            name=name,
+            instance=instance,
+            confirm_deletion=confirm_deletion,
             namespace=namespace,
             dry_run=dry_run,
         )
