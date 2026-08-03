@@ -15,6 +15,10 @@ The server exposes the CloudNativePG tools from the v1 implementation:
 - `get_cluster_status`
 - `create_postgres_cluster`
 - `scale_postgres_cluster`
+- `resize_postgres_cluster`
+- `get_cluster_resize_status`
+- `promote_cluster_instance`
+- `delete_cluster_instance`
 - `delete_postgres_cluster`
 - `list_postgres_roles`
 - `get_postgres_role_status`
@@ -25,6 +29,40 @@ The server exposes the CloudNativePG tools from the v1 implementation:
 - `get_postgres_database_status`
 - `create_postgres_database`
 - `delete_postgres_database`
+
+### Storage resize
+
+`resize_postgres_cluster` changes `.spec.storage.size`. Growing is applied
+directly and CloudNativePG expands the volumes in place. Shrinking cannot be
+applied to an existing volume at all, so the tool only *starts* a migration and
+returns immediately — replication can take hours, so no tool call blocks on it.
+
+Starting a shrink (requires `confirm_shrink=True`) performs three requests: set
+`cnpg.io/validation: disabled`, patch the smaller `.spec.storage.size` together
+with an increased `.spec.instances` in a single request so the added instance is
+created at the new size, then remove the annotation. Validation is restored even
+if the patch fails; `restore_validation_only=True` recovers the annotation if a
+run is interrupted.
+
+The rest of the workflow is driven by separate tools, so you decide when each
+step happens:
+
+1. `get_cluster_resize_status` — per-instance volume sizes (requested vs.
+   actual), which instances still hold the previous size, replication health,
+   and the recommended next action.
+2. `promote_cluster_instance` — switchover to the new, smaller instance by
+   setting `.status.targetPrimary`. Refuses instances the operator does not
+   report as healthy unless `force=True`.
+3. `delete_cluster_instance` — deletes one instance's PVCs and Pod, leaving
+   `.spec.instances` alone so the operator rebuilds it from the primary at the
+   current size. Refuses to delete the current primary. Repeat for each instance
+   still on the old size, one at a time.
+4. `scale_postgres_cluster` — return to your original instance count.
+
+Growing needs a storage class with working volume expansion. If
+`get_cluster_resize_status` keeps showing `requested / actual` sizes that differ,
+the provisioner may advertise `allowVolumeExpansion` without running a resize
+controller; the status output points at the PVC events that confirm this.
 
 Roles are managed through CloudNativePG's first-class `DatabaseRole` CRD rather
 than the deprecated Cluster `.spec.managed.roles` field. `create_postgres_role`
