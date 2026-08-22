@@ -10,6 +10,7 @@ EXPECTED_CNPG_TOOLS = {
     "get_cluster_status",
     "create_postgres_cluster",
     "scale_postgres_cluster",
+    "configure_projected_volumes",
     "delete_postgres_cluster",
     "resize_postgres_cluster",
     "get_cluster_resize_status",

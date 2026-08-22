@@ -15,6 +15,7 @@ The server exposes the CloudNativePG tools from the v1 implementation:
 - `get_cluster_status`
 - `create_postgres_cluster`
 - `scale_postgres_cluster`
+- `configure_projected_volumes`
 - `resize_postgres_cluster`
 - `get_cluster_resize_status`
 - `promote_cluster_instance`
@@ -29,6 +30,54 @@ The server exposes the CloudNativePG tools from the v1 implementation:
 - `get_postgres_database_status`
 - `create_postgres_database`
 - `delete_postgres_database`
+
+### Projected volumes
+
+Secrets and ConfigMaps can be projected into the instance pods, which
+CloudNativePG mounts under `/projected`. `create_postgres_cluster` accepts
+`projected_secrets`, `projected_config_maps`, and `projected_default_mode`;
+`configure_projected_volumes` sets them on an existing cluster.
+
+Rather than requiring a full Kubernetes `VolumeProjection`, you name the resource
+and, optionally, the directory it maps to. Every key becomes a file named after
+the key:
+
+```python
+projected_secrets=["db-creds"]              # -> /projected/secret/db-creds/{username,password}
+projected_config_maps=["app-config"]        # -> /projected/config/app-config/{ca.crt,settings.ini}
+projected_secrets={"db-creds": "db"}        # -> /projected/db/{username,password}
+projected_config_maps={"app-config": "conf/app"}
+```
+
+The default directory is `secret/<name>` or `config/<name>`, so a Secret and a
+ConfigMap sharing a name cannot collide. Directories are relative to `/projected`
+— CloudNativePG always mounts the template there and the path is not
+configurable, so an absolute directory is rejected.
+
+`projected_default_mode` accepts octal strings like `"0400"` as well as the
+decimal integers the Kubernetes API stores. Note that CloudNativePG runs
+instances with `fsGroup` set, so Kubernetes may add the group-read bit — a
+requested `0400` typically lands as `0440` on disk.
+
+Kubernetes maps projections per key, not per resource, so each Secret and
+ConfigMap is read to enumerate its keys. That is a snapshot: **keys added to a
+resource afterwards are not projected until you configure the projection again.**
+The resource must exist when the projection is configured.
+
+Paths are validated up front. Neither the Cluster CRD nor the CloudNativePG
+webhook rejects an absolute path, a `..` element, or two sources claiming the
+same file — those are only caught later at Pod admission, which surfaces as
+instances that will not start.
+
+`configure_projected_volumes` replaces `.spec.projectedVolumeTemplate` outright
+rather than merging, so pass the complete desired set each time; `clear=True`
+removes it. Changing projected volumes alters the instance pod spec, so
+CloudNativePG performs a rolling restart to apply it. The current projection is
+reported by `get_cluster_status` with `detail_level="detailed"`.
+
+Sources these tools do not build (for example `serviceAccountToken` or
+`downwardAPI` applied out of band) are shown in the read-back output but are
+replaced if you call `configure_projected_volumes`.
 
 ### Storage resize
 
