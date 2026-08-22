@@ -97,6 +97,15 @@ CNPG_PLURAL = "clusters"
 CNPG_DATABASE_PLURAL = "databases"
 CNPG_DATABASE_ROLE_PLURAL = "databaseroles"
 
+# CloudNativePG always mounts .spec.projectedVolumeTemplate under this fixed
+# path; item paths are relative to it and the Pod API rejects absolute ones.
+PROJECTED_VOLUME_MOUNT_BASE = "/projected"
+
+# Default parent directory per projection type, so a Secret and a ConfigMap that
+# share a name cannot collide on the same file paths.
+PROJECTED_SECRET_DIR = "secret"
+PROJECTED_CONFIG_MAP_DIR = "config"
+
 # Setting this Cluster annotation to "disabled" turns off the CloudNativePG
 # validating webhook, which is what makes an otherwise rejected storage shrink
 # possible. It is restored as soon as the change is applied.
@@ -983,6 +992,262 @@ async def write_role_secret(
     return True
 
 
+def parse_file_mode(value: Any, field_label: str) -> int:
+    """
+    Parse a file permission mode into the decimal form the Kubernetes API expects.
+
+    Accepts a decimal int (as the API stores it) or a string. Strings written the
+    way permissions are usually spelled ('0400', '0o400') are read as octal, so
+    callers do not have to convert 0400 to 256 by hand.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{field_label} must be a file mode, not a boolean.")
+
+    if isinstance(value, int):
+        mode = value
+    elif isinstance(value, str):
+        text = value.strip()
+        try:
+            if text.lower().startswith("0o"):
+                mode = int(text, 8)
+            elif text.startswith("0") and len(text) > 1:
+                mode = int(text, 8)
+            else:
+                mode = int(text, 10)
+        except ValueError:
+            raise ValueError(
+                f"{field_label} '{value}' is not a valid file mode. Use an octal string "
+                "like '0400' or a decimal integer like 256."
+            )
+    else:
+        raise ValueError(f"{field_label} must be an integer or a string, got {type(value).__name__}.")
+
+    if not 0 <= mode <= 511:
+        raise ValueError(
+            f"{field_label} must be between 0000 and 0777 octal (0-511 decimal), got {mode}."
+        )
+    return mode
+
+
+def validate_projected_directory(directory: str, label: str) -> str:
+    """
+    Validate a projected volume directory and return it without surrounding slashes.
+
+    Neither the Cluster CRD nor the CloudNativePG webhook checks these paths; they
+    are only rejected later when the Pod is admitted, which surfaces as instances
+    that will not start. Validating here turns that into an immediate error.
+    """
+    if not isinstance(directory, str):
+        raise ValueError(f"{label} must be a string, got {type(directory).__name__}.")
+
+    cleaned = directory.strip().strip("/")
+    if not cleaned:
+        raise ValueError(f"{label} cannot be empty.")
+    if directory.strip().startswith("/"):
+        raise ValueError(
+            f"{label} '{directory}' must be relative. Every projected file lands under "
+            f"{PROJECTED_VOLUME_MOUNT_BASE}, so an absolute path is not possible."
+        )
+    if ".." in cleaned.split("/"):
+        raise ValueError(f"{label} '{directory}' may not contain a '..' path element.")
+    return cleaned
+
+
+def normalize_projection_entries(entries: Any, source_kind: Literal["secret", "configMap"]) -> List[tuple]:
+    """
+    Normalize the simplified projection input into (resource_name, directory) pairs.
+
+    Accepted forms:
+        ["db-creds", "app-config"]              default directory per resource
+        {"db-creds": "db", "app-config": None}  explicit directory, None for the default
+    """
+    label = "projected_secrets" if source_kind == "secret" else "projected_config_maps"
+    default_parent = PROJECTED_SECRET_DIR if source_kind == "secret" else PROJECTED_CONFIG_MAP_DIR
+
+    if entries is None:
+        return []
+
+    if isinstance(entries, dict):
+        raw_pairs = list(entries.items())
+    elif isinstance(entries, list):
+        raw_pairs = []
+        for entry in entries:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    f"{label} list entries must be resource names. To choose a directory, "
+                    f"pass a mapping like {{\"my-resource\": \"my-dir\"}}. Got {type(entry).__name__}."
+                )
+            raw_pairs.append((entry, None))
+    else:
+        raise ValueError(
+            f"{label} must be a list of names or a {{name: directory}} mapping, "
+            f"got {type(entries).__name__}."
+        )
+
+    pairs = []
+    for name, directory in raw_pairs:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"{label} contains an entry with an empty resource name.")
+        name = name.strip()
+        if directory is None or (isinstance(directory, str) and not directory.strip()):
+            resolved = f"{default_parent}/{name}"
+        else:
+            resolved = validate_projected_directory(directory, f"{label} directory for '{name}'")
+        pairs.append((name, resolved))
+
+    return pairs
+
+
+async def read_projection_keys(namespace: str, source_kind: Literal["secret", "configMap"], name: str) -> List[str]:
+    """
+    Read the keys of a Secret or ConfigMap so each one can be mapped to a file.
+
+    Kubernetes has no per-source directory for these projections, only per-key
+    paths, so projecting a whole resource into a directory means enumerating its
+    keys here. That is a snapshot: keys added to the resource afterwards are not
+    projected until the projection is configured again.
+    """
+    _, core_api = get_kubernetes_clients()
+    label = "Secret" if source_kind == "secret" else "ConfigMap"
+
+    try:
+        if source_kind == "secret":
+            resource = await asyncio.to_thread(
+                core_api.read_namespaced_secret, name=name, namespace=namespace
+            )
+            keys = list((resource.data or {}).keys())
+        else:
+            resource = await asyncio.to_thread(
+                core_api.read_namespaced_config_map, name=name, namespace=namespace
+            )
+            keys = list((resource.data or {}).keys()) + list((resource.binary_data or {}).keys())
+    except ApiException as e:
+        if e.status == 404:
+            raise ValueError(
+                f"{label} '{namespace}/{name}' was not found. It must exist before it can be "
+                "projected, because its keys become the projected file names."
+            )
+        if e.status == 403:
+            raise ValueError(
+                f"Permission denied reading {label} '{namespace}/{name}'. The service account "
+                f"needs get access to {label.lower()}s in this namespace."
+            )
+        raise Exception(format_error_message(e, f"reading {label.lower()} {namespace}/{name}"))
+
+    if not keys:
+        raise ValueError(f"{label} '{namespace}/{name}' has no keys, so there is nothing to project.")
+
+    return sorted(keys)
+
+
+async def build_projected_volume_template(
+    namespace: str,
+    projected_secrets: Any = None,
+    projected_config_maps: Any = None,
+    projected_default_mode: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Build .spec.projectedVolumeTemplate from the simplified inputs.
+
+    Each Secret or ConfigMap is projected into its own directory, one file per key,
+    named after the key. Returns None when nothing is projected.
+    """
+    pairs = [
+        (name, directory, "secret")
+        for name, directory in normalize_projection_entries(projected_secrets, "secret")
+    ] + [
+        (name, directory, "configMap")
+        for name, directory in normalize_projection_entries(projected_config_maps, "configMap")
+    ]
+
+    if not pairs:
+        if projected_default_mode is not None:
+            raise ValueError(
+                "projected_default_mode was given but no projected_secrets or "
+                "projected_config_maps were provided."
+            )
+        return None
+
+    seen_resources = set()
+    claimed_paths: Dict[str, str] = {}
+    sources = []
+
+    for name, directory, source_kind in pairs:
+        if (source_kind, name) in seen_resources:
+            label = "Secret" if source_kind == "secret" else "ConfigMap"
+            raise ValueError(f"{label} '{name}' is listed more than once.")
+        seen_resources.add((source_kind, name))
+
+        keys = await read_projection_keys(namespace, source_kind, name)
+
+        items = []
+        for key in keys:
+            path = f"{directory}/{key}"
+            owner = f"{source_kind} '{name}'"
+            if path in claimed_paths:
+                raise ValueError(
+                    f"Both {claimed_paths[path]} and {owner} would project a file at "
+                    f"{PROJECTED_VOLUME_MOUNT_BASE}/{path}. Give one of them a different directory."
+                )
+            claimed_paths[path] = owner
+            items.append({"key": key, "path": path})
+
+        sources.append({source_kind: {"name": name, "items": items}})
+
+    template: Dict[str, Any] = {"sources": sources}
+    if projected_default_mode is not None:
+        template["defaultMode"] = parse_file_mode(projected_default_mode, "projected_default_mode")
+    return template
+
+
+def format_projected_volume_template(template: Optional[Dict[str, Any]]) -> str:
+    """Describe a projected volume template, including where each file lands."""
+    if not template or not template.get("sources"):
+        return "- (none)"
+
+    lines = []
+    default_mode = template.get("defaultMode")
+    if default_mode is not None:
+        lines.append(f"- Default mode: {default_mode} ({oct(default_mode)})")
+
+    for source in template["sources"]:
+        for kind, label in (("secret", "Secret"), ("configMap", "ConfigMap")):
+            if kind not in source:
+                continue
+            spec = source[kind] or {}
+            name = spec.get("name", "unknown")
+            optional = " (optional)" if spec.get("optional") else ""
+            items = spec.get("items")
+            if not items:
+                lines.append(
+                    f"- {label} '{name}'{optional}: all keys -> {PROJECTED_VOLUME_MOUNT_BASE}/<key>"
+                )
+                continue
+
+            directories = {item.get("path", "").rsplit("/", 1)[0] for item in items if item.get("path")}
+            if len(directories) == 1:
+                directory = directories.pop()
+                keys = ", ".join(item.get("key", "?") for item in items)
+                location = f"{PROJECTED_VOLUME_MOUNT_BASE}/{directory}" if directory else PROJECTED_VOLUME_MOUNT_BASE
+                lines.append(f"- {label} '{name}'{optional}: {location}/ <- {keys}")
+            else:
+                for item in items:
+                    mode = f", mode {oct(item['mode'])}" if item.get("mode") is not None else ""
+                    lines.append(
+                        f"- {label} '{name}'{optional}: {item.get('key')} -> "
+                        f"{PROJECTED_VOLUME_MOUNT_BASE}/{item.get('path')}{mode}"
+                    )
+
+    # A source may use a projection type these tools do not build (for example
+    # serviceAccountToken applied out of band); report it rather than hide it.
+    for source in template["sources"]:
+        for kind in source:
+            if kind not in ("secret", "configMap"):
+                lines.append(f"- {kind}: (projection not managed by these tools)")
+
+    return "\n".join(lines)
+
+
 def format_cluster_status(cluster: Dict[str, Any], detail_level: str = "concise") -> str:
     """Format cluster status in a human-readable way."""
     metadata = cluster.get('metadata', {})
@@ -1009,7 +1274,12 @@ def format_cluster_status(cluster: Dict[str, Any], detail_level: str = "concise"
         
         result += f"- PostgreSQL Version: {pg_version}\n"
         result += f"- Storage Size: {storage_size}\n"
-        
+
+        projected = spec.get('projectedVolumeTemplate')
+        if projected:
+            result += "\n**Projected Volumes:**\n"
+            result += format_projected_volume_template(projected) + "\n"
+
         # Add conditions
         conditions = status.get('conditions', [])
         if conditions:
@@ -1112,6 +1382,21 @@ class CreateClusterInput(BaseModel):
         description="Pod tolerations allowing scheduling onto tainted nodes (spec.affinity.tolerations). Dedicated local-storage nodes are often tainted; supply matching tolerations so pods are admitted. Each entry uses standard fields: key, operator, value, effect, tolerationSeconds.",
         examples=[[{"key": "storage", "operator": "Equal", "value": "local", "effect": "NoSchedule"}]]
     )
+    projected_secrets: Optional[Any] = Field(
+        None,
+        description="Secrets to project into the instance pods. Either a list of Secret names, or a {name: directory} mapping. Each Secret is projected into its own directory, one file per key, named after the key. Default directory is /projected/secret/<name>; directories are relative to /projected.",
+        examples=[["db-creds"], {"db-creds": "db"}]
+    )
+    projected_config_maps: Optional[Any] = Field(
+        None,
+        description="ConfigMaps to project, same shapes as projected_secrets. Default directory is /projected/config/<name>.",
+        examples=[["app-config"], {"app-config": "conf/app"}]
+    )
+    projected_default_mode: Optional[Any] = Field(
+        None,
+        description="Default file mode for every projected file, for example '0400' or 256. Requires at least one projected source. Note that CloudNativePG runs instances with fsGroup set, so Kubernetes may add the group-read bit: a requested 0400 typically lands as 0440 on disk.",
+        examples=["0400", 256]
+    )
     wait: bool = Field(
         False,
         description="Wait for the cluster to become operational before returning. If False, returns immediately after creation. Automatically set to False if instances > 5."
@@ -1179,6 +1464,36 @@ class ListRolesInput(BaseModel):
     namespace: Optional[str] = Field(
         None,
         description="Kubernetes namespace where the cluster exists. If not specified, uses the current namespace from your Kubernetes context."
+    )
+
+
+class ConfigureProjectedVolumesInput(BaseModel):
+    """Input for setting a cluster's projected volumes."""
+    name: str = Field(..., description="Name of the CloudNativePG cluster.")
+    projected_secrets: Optional[Any] = Field(
+        None,
+        description="Secrets to project. Either a list of Secret names, or a {name: directory} mapping. Each Secret is projected into its own directory, one file per key. Default directory is /projected/secret/<name>. Replaces the existing projection, so pass the complete desired set.",
+        examples=[["db-creds"], {"db-creds": "db"}]
+    )
+    projected_config_maps: Optional[Any] = Field(
+        None,
+        description="ConfigMaps to project, same shapes as projected_secrets. Default directory is /projected/config/<name>."
+    )
+    projected_default_mode: Optional[Any] = Field(
+        None,
+        description="Default file mode for every projected file, for example '0400' or 256. Note that CloudNativePG runs instances with fsGroup set, so Kubernetes may add the group-read bit: a requested 0400 typically lands as 0440 on disk."
+    )
+    clear: bool = Field(
+        False,
+        description="If True, remove the projected volume template entirely. Cannot be combined with the projected_* fields."
+    )
+    namespace: Optional[str] = Field(
+        None,
+        description="Kubernetes namespace where the cluster exists. If not specified, uses the current namespace from your Kubernetes context."
+    )
+    dry_run: bool = Field(
+        False,
+        description="If True, shows what would change without applying it."
     )
 
 
@@ -1653,6 +1968,7 @@ async def get_cluster_status(
                     "storage_class": spec.get('storage', {}).get('storageClass'),
                     "conditions": status.get('conditions', []),
                     "postgresql_parameters": spec.get('postgresql', {}).get('parameters', {}),
+                    "projected_volume_template": spec.get('projectedVolumeTemplate'),
                     # Roles are managed through DatabaseRole CRDs; this reports only
                     # leftovers in the deprecated inline Cluster field.
                     "legacy_managed_roles": spec.get('managed', {}).get('roles', [])
@@ -1681,6 +1997,9 @@ async def create_postgres_cluster(
     image_pull_policy: Optional[str] = None,
     node_selector: Optional[Dict[str, str]] = None,
     tolerations: Optional[List[Dict[str, Any]]] = None,
+    projected_secrets: Optional[Any] = None,
+    projected_config_maps: Optional[Any] = None,
+    projected_default_mode: Optional[Any] = None,
     wait: bool = False,
     timeout: Optional[int] = None,
     namespace: Optional[str] = None,
@@ -1732,6 +2051,18 @@ async def create_postgres_cluster(
                     "effect": "NoSchedule"}]. Each entry accepts the standard toleration
                     fields: key, operator ('Equal' or 'Exists'), value, effect
                     ('NoSchedule', 'PreferNoSchedule', 'NoExecute'), and tolerationSeconds.
+        projected_secrets: Secrets to project into the instance pods. Either a list of
+                          Secret names, or a {name: directory} mapping. Each Secret is
+                          projected into its own directory, one file per key, named
+                          after the key. The default directory is
+                          /projected/secret/<name>, so key 'password' of Secret
+                          'db-creds' lands at /projected/secret/db-creds/password.
+                          Directories are relative to /projected.
+        projected_config_maps: ConfigMaps to project, same shapes as projected_secrets.
+                              Default directory is /projected/config/<name>.
+        projected_default_mode: Default file mode for every projected file, e.g. "0400"
+                               or 256. Requires at least one projected source.
+                               Note that CloudNativePG runs instances with fsGroup set, so Kubernetes may add the group-read bit: a requested 0400 typically lands as 0440 on disk.
         wait: If True, wait for the cluster to become operational before returning.
               If False (default), return immediately after creation. Automatically
               set to False if instances > 5 (to avoid waiting more than 5 minutes).
@@ -1863,6 +2194,18 @@ async def create_postgres_cluster(
         if affinity:
             cluster_spec["spec"]["affinity"] = affinity
 
+        # Projected volumes are mounted by CloudNativePG under /projected. Building
+        # the template reads each Secret/ConfigMap, because Kubernetes maps
+        # projections per key rather than per resource.
+        try:
+            projected_template = await build_projected_volume_template(
+                namespace, projected_secrets, projected_config_maps, projected_default_mode
+            )
+        except ValueError as e:
+            return f"Error: {e}"
+        if projected_template:
+            cluster_spec["spec"]["projectedVolumeTemplate"] = projected_template
+
         # Pre-rendered display lines for optional settings (used in status messages).
         storage_class_line = f"- Storage Class: {storage_class}\n" if storage_class else ""
         pull_policy_line = f"- Image Pull Policy: {image_pull_policy}\n" if image_pull_policy else ""
@@ -1873,6 +2216,11 @@ async def create_postgres_cluster(
         tolerations_line = (
             f"- Tolerations: {len(tolerations)} configured\n" if tolerations else ""
         )
+        projected_lines = (
+            "- Projected Volumes (mounted under /projected):\n"
+            + "\n".join(f"  {line}" for line in format_projected_volume_template(projected_template).splitlines())
+            + "\n"
+        ) if projected_template else ""
 
         # If dry_run, return the cluster definition without creating
         if dry_run:
@@ -1883,7 +2231,7 @@ This is the cluster definition that would be created:
 
 ```yaml
 {cluster_yaml}```
-
+{projected_lines}
 To create this cluster, call create_postgres_cluster again with dry_run=False (or omit the dry_run parameter).
 """
 
@@ -1912,7 +2260,7 @@ Configuration:
 - Instances: {instances}
 - Container Image: {cluster_image}
 - Storage Size: {storage_size}
-{storage_class_line}{pull_policy_line}{node_selector_line}{tolerations_line}{auto_disabled_msg}
+{storage_class_line}{pull_policy_line}{node_selector_line}{tolerations_line}{projected_lines}{auto_disabled_msg}
 The cluster is now being provisioned. You can monitor its status using:
 get_cluster_status(namespace="{namespace}", name="{cluster_name}")
 
@@ -1935,7 +2283,7 @@ Configuration:
 - Instances: {instances}
 - Container Image: {cluster_image}
 - Storage Size: {storage_size}
-{storage_class_line}{pull_policy_line}{node_selector_line}{tolerations_line}
+{storage_class_line}{pull_policy_line}{node_selector_line}{tolerations_line}{projected_lines}
 Timeout: {timeout} seconds elapsed
 
 The cluster is still provisioning. Check status with:
@@ -1961,7 +2309,7 @@ Configuration:
 - Instances: {instances} ({ready_instances} ready)
 - Container Image: {cluster_image}
 - Storage Size: {storage_size}
-{storage_class_line}{pull_policy_line}{node_selector_line}{tolerations_line}- Current Primary: {current_primary}
+{storage_class_line}{pull_policy_line}{node_selector_line}{tolerations_line}{projected_lines}- Current Primary: {current_primary}
 
 Status: {phase}
 
@@ -2066,6 +2414,135 @@ get_cluster_status(namespace="{namespace}", name="{name}")
 
     except Exception as e:
         return format_error_message(e, f"scaling cluster {namespace}/{name}")
+
+
+
+@with_mcp_context
+async def configure_projected_volumes(
+    context: MCPContext,
+    name: str,
+    projected_secrets: Optional[Any] = None,
+    projected_config_maps: Optional[Any] = None,
+    projected_default_mode: Optional[Any] = None,
+    clear: bool = False,
+    namespace: Optional[str] = None,
+    dry_run: bool = False
+) -> str:
+    """
+    Set the projected volumes of an existing PostgreSQL cluster.
+
+    Replaces .spec.projectedVolumeTemplate with the sources given here, so pass
+    the complete desired set each time. CloudNativePG mounts every source under
+    /projected.
+
+    Kubernetes maps projections per key, not per resource, so each Secret and
+    ConfigMap is read to enumerate its keys. That is a snapshot: keys added to a
+    resource afterwards are not projected until this tool is called again.
+
+    Changing projected volumes alters the instance pod spec, so CloudNativePG
+    performs a rolling restart of the cluster to apply it.
+
+    Args:
+        name: Name of the cluster.
+        projected_secrets: Secrets to project. Either a list of Secret names, or a
+                          {name: directory} mapping. Each Secret is projected into its own
+                          directory, one file per key, named after the key. The default
+                          directory is /projected/secret/<name>.
+        projected_config_maps: ConfigMaps to project, same shapes as projected_secrets.
+                              Default directory is /projected/config/<name>.
+        projected_default_mode: Default file mode for every projected file, e.g. "0400" or 256.
+                               Note that CloudNativePG runs instances with fsGroup set, so Kubernetes may add the group-read bit: a requested 0400 typically lands as 0440 on disk.
+        clear: If True, remove the projected volume template entirely. Cannot be
+              combined with projected_secrets or projected_config_maps.
+        namespace: Kubernetes namespace where the cluster exists.
+        dry_run: If True, shows what would change without applying it.
+
+    Returns:
+        The resulting projection, or a preview when dry_run=True.
+    """
+    try:
+        if namespace is None:
+            namespace = get_current_namespace()
+
+        if clear and (projected_secrets or projected_config_maps or projected_default_mode is not None):
+            return "Error: clear=True cannot be combined with projected_secrets, projected_config_maps, or projected_default_mode."
+
+        if not clear and not projected_secrets and not projected_config_maps:
+            return (
+                "Error: provide projected_secrets and/or projected_config_maps, or pass clear=True "
+                "to remove the projected volume template."
+            )
+
+        cluster = await get_cnpg_cluster(namespace, name)
+        current = cluster.get("spec", {}).get("projectedVolumeTemplate")
+
+        if clear:
+            if not current:
+                return f"Cluster '{namespace}/{name}' has no projected volume template. No change made."
+            template = None
+        else:
+            try:
+                template = await build_projected_volume_template(
+                    namespace, projected_secrets, projected_config_maps, projected_default_mode
+                )
+            except ValueError as e:
+                return f"Error: {e}"
+
+        current_text = format_projected_volume_template(current)
+        new_text = format_projected_volume_template(template)
+
+        if dry_run:
+            return f"""Dry run: Projected volume change for cluster '{namespace}/{name}'
+
+Current projection:
+{current_text}
+
+Proposed projection:
+{new_text}
+
+Impact:
+- .spec.projectedVolumeTemplate is replaced outright, not merged.
+- Changing it alters the instance pod spec, so CloudNativePG performs a rolling
+  restart of the cluster to apply it.
+
+To apply this change, call configure_projected_volumes again with dry_run=False (or omit the dry_run parameter).
+"""
+
+        # A JSON merge patch removes a field when its value is null, but it MERGES
+        # nested objects rather than replacing them. Send an explicit null for
+        # defaultMode when it was not requested, so a previously set value does not
+        # survive a replacement.
+        patch_template = template
+        if patch_template is not None:
+            patch_template = dict(patch_template)
+            patch_template.setdefault("defaultMode", None)
+        await patch_cnpg_cluster_spec(namespace, name, {"projectedVolumeTemplate": patch_template})
+
+        if template is None:
+            return f"""Removed the projected volume template from cluster '{namespace}/{name}'.
+
+Previous projection:
+{current_text}
+
+CloudNativePG performs a rolling restart to apply the new pod spec. Monitor it with:
+get_cluster_status(name="{name}", namespace="{namespace}", detail_level="detailed")
+"""
+
+        return f"""Updated projected volumes on cluster '{namespace}/{name}'.
+
+Previous projection:
+{current_text}
+
+Current projection:
+{new_text}
+
+CloudNativePG performs a rolling restart to apply the new pod spec. Monitor it with:
+get_cluster_status(name="{name}", namespace="{namespace}", detail_level="detailed")
+"""
+
+    except Exception as e:
+        return format_error_message(e, f"configuring projected volumes on cluster {namespace}/{name}")
+
 
 
 
@@ -3980,6 +4457,7 @@ def register_resources(mcp):
             "get_cluster_status",
             "create_postgres_cluster",
             "scale_postgres_cluster",
+            "configure_projected_volumes",
             "resize_postgres_cluster",
             "get_cluster_resize_status",
             "promote_cluster_instance",
@@ -4113,6 +4591,9 @@ def register_tools(mcp):
         image_pull_policy: str = None,
         node_selector: Dict[str, str] = None,
         tolerations: List[Dict[str, Any]] = None,
+        projected_secrets: Any = None,
+        projected_config_maps: Any = None,
+        projected_default_mode: Any = None,
         wait: bool = False,
         timeout: int = None,
         namespace: str = None,
@@ -4131,6 +4612,9 @@ def register_tools(mcp):
             image_pull_policy=image_pull_policy,
             node_selector=node_selector,
             tolerations=tolerations,
+            projected_secrets=projected_secrets,
+            projected_config_maps=projected_config_maps,
+            projected_default_mode=projected_default_mode,
             wait=wait,
             timeout=timeout,
             namespace=namespace,
@@ -4150,6 +4634,29 @@ def register_tools(mcp):
             context=ctx,
             name=name,
             instances=instances,
+            namespace=namespace,
+            dry_run=dry_run,
+        )
+
+    @mcp.tool(name="configure_projected_volumes")
+    async def configure_projected_volumes_tool(
+        name: str,
+        projected_secrets: Any = None,
+        projected_config_maps: Any = None,
+        projected_default_mode: Any = None,
+        clear: bool = False,
+        namespace: str = None,
+        dry_run: bool = False,
+        ctx: Context = None,
+    ) -> str:
+        """Set the Secrets and ConfigMaps projected into a cluster's pods under /projected."""
+        return await configure_projected_volumes(
+            context=ctx,
+            name=name,
+            projected_secrets=projected_secrets,
+            projected_config_maps=projected_config_maps,
+            projected_default_mode=projected_default_mode,
+            clear=clear,
             namespace=namespace,
             dry_run=dry_run,
         )

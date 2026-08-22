@@ -15,6 +15,10 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Projected volumes map per key, so the ConfigMap's keys are read to build them
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["postgresql.cnpg.io"]
     resources: ["clusters", "databases", "databaseroles"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -76,6 +80,10 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Projected volumes map per key, so the ConfigMap's keys are read to build them
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["postgresql.cnpg.io"]
     resources: ["clusters", "databases", "databaseroles"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
